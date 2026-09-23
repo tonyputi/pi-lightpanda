@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-title:
+    runs-on: ubuntu-latest
+    # Dependabot titles ("Bump ...") are never conventional; the squash-merge
+    # title we choose is what semantic-release actually reads.
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm test
