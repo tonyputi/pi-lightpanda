@@ -1,6 +1,6 @@
 {
   "name": "pi-lightpanda",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Lightweight headless browser for the Pi agent via Lightpanda (CDP-compatible, ~16x less memory than Chrome)",
   "license": "MIT",
   "type": "module",
