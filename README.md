@@ -61,43 +61,52 @@ or from a local checkout:
 pi install /absolute/path/to/pi-lightpanda
 ```
 
-## Assisted setup
+## Setup
 
-One command downloads the right nightly binary, verifies it, and emits the
-`.envrc` block:
+The whole setup runs **inside Pi** — no separate commands, no restart juggling:
 
 ```bash
-npx pi-lightpanda-setup
+pi install npm:pi-lightpanda   # then start pi and run:
+/lightpanda setup
 ```
 
-Flags: `--bin <path>` to choose the install location (default
-`~/.pi/agent/bin/lightpanda`), `--envrc <path>` to append the block to a file
-instead of printing it, `--check` to only report the platform asset and
-whether a binary is already usable.
+What happens: confirm the download → the right nightly binary for your
+platform is fetched from the `lightpanda-io/browser` GitHub releases into
+`~/.pi/agent/bin/lightpanda` and verified with `lightpanda version` → done.
+The extension resolves the binary dynamically (see Configuration), so the
+tools work immediately — no restart, no `.envrc`. Check any time with
+`/lightpanda status`.
 
 Prefer the manual route? Install from
 [lightpanda.io/docs](https://lightpanda.io/docs) (one-liner, brew, docker,
-nightly builds), then continue below. Native Windows is unsupported — run
-inside WSL2 and point at the server.
+nightly builds) and set `PI_LIGHTPANDA_BIN` if the binary is not on `PATH`.
+Native Windows is unsupported — run inside WSL2 and set `PI_LIGHTPANDA_BIN`
+to the host serving CDP (or install inside WSL and run pi there).
 
 ## Configuration
 
-One environment variable is required (typically via direnv); the rest are
-optional tuning:
+No configuration is required after `/lightpanda setup`. The binary is
+resolved at each tool call, in this order:
+
+1. `PI_LIGHTPANDA_BIN` (if set — e.g. via direnv)
+2. `~/.pi/agent/bin/lightpanda` (where `/lightpanda setup` installs)
+3. `lightpanda` on `PATH`
+
+The remaining variables are optional tuning:
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `PI_LIGHTPANDA_BIN` | path to the `lightpanda` binary | `lightpanda` on `PATH` |
+| `PI_LIGHTPANDA_BIN` | path to the `lightpanda` binary (optional — see resolution order above) | resolved automatically |
 | `PI_LIGHTPANDA_HOST` | CDP host — **loopback only** | `127.0.0.1` |
 | `PI_LIGHTPANDA_PORT` | CDP port | `9222` |
 | `PI_LIGHTPANDA_TIMEOUT_MS` | per-operation timeout | `30000` |
 | `PI_LIGHTPANDA_MAX_BYTES` | max text bytes returned per tool | `12288` |
 | `PI_LIGHTPANDA_MAX_REFS` | max snapshot refs | `50` |
 
-Example `.envrc`:
+Example `.envrc` (only if you keep the binary somewhere else):
 
 ```bash
-export PI_LIGHTPANDA_BIN="$HOME/.pi/agent/bin/lightpanda"
+export PI_LIGHTPANDA_BIN="$HOME/tools/lightpanda"
 ```
 
 ## How it works
@@ -127,8 +136,9 @@ Tools (called by the agent): `lightpanda_fetch`, `lightpanda_navigate`,
 `lightpanda_snapshot`, `lightpanda_act` (click/fill/type/select/press/hover),
 `lightpanda_eval`, `lightpanda_run`, `lightpanda_status`.
 
-Command: `/lightpanda status | start | stop` — server health and lifecycle
-(external servers are never stopped, only ones this extension spawned).
+Command: `/lightpanda status | start | stop | setup` — server health, lifecycle,
+and in-Pi binary install (external servers are never stopped, only ones this
+extension spawned).
 
 Suggested loop for the agent: `fetch` for reading → `navigate` → `snapshot`
 → `act` → re-`snapshot` → … → `run` to save a working flow as PandaScript.
@@ -146,8 +156,8 @@ Suggested loop for the agent: `fetch` for reading → `navigate` → `snapshot`
 
 Run `/lightpanda status` inside Pi.
 
-- **binary … not found** — install it (`npx pi-lightpanda-setup`) or set
-  `PI_LIGHTPANDA_BIN` to the binary path, then restart Pi.
+- **binary … not found** — run `/lightpanda setup`, or set `PI_LIGHTPANDA_BIN`
+  to the binary path. No restart needed: resolution happens at every call.
 - **did not answer on 127.0.0.1:9222 within 15s** — the binary may be the
   wrong platform asset or missing system libs; try `<bin> version` manually.
 - **fetch/navigate/eval failures on a specific site** — likely partial Web

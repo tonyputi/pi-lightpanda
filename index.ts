@@ -35,10 +35,14 @@
  *     complex sites may fail and screenshots are not offered. When a page
  *     needs full Chromium, use a Chromium-backed extension instead.
  *
+ * Setup runs entirely inside Pi: /lightpanda setup downloads the nightly
+ * binary to ~/.pi/agent/bin/lightpanda and verifies it — after that the tools
+ * work immediately, no restart and no .envrc needed.
+ *
  * Configuration (environment variables, e.g. via direnv):
- *   PI_LIGHTPANDA_BIN           path to the `lightpanda` binary
- *                               (default: `lightpanda` on PATH;
- *                               run `npx pi-lightpanda-setup` to install it)
+ *   PI_LIGHTPANDA_BIN           path to the `lightpanda` binary (optional —
+ *                               resolution order at call time: this variable,
+ *                               then ~/.pi/agent/bin/lightpanda, then PATH)
  *   PI_LIGHTPANDA_HOST          CDP host, loopback only (default 127.0.0.1)
  *   PI_LIGHTPANDA_PORT          CDP port (default 9222)
  *   PI_LIGHTPANDA_TIMEOUT_MS    per-operation timeout (default 30000)
@@ -46,15 +50,16 @@
  *   PI_LIGHTPANDA_MAX_REFS      max snapshot refs (default 50)
  */
 
-import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
 import { Type } from "typebox";
+import { binaryUsable, defaultBinPath, runSetupWizard, type WizardUI } from "./setup.ts";
 
 // --- config ----------------------------------------------------------------
 
 interface LightpandaConfig {
-	bin: string;
 	host: string;
 	port: number;
 	timeoutMs: number;
@@ -97,7 +102,6 @@ function readConfig(env: NodeJS.ProcessEnv = process.env): { config: LightpandaC
 	if (maxRefs === null) return { error: `PI_LIGHTPANDA_MAX_REFS must be a positive integer — got "${env.PI_LIGHTPANDA_MAX_REFS}"` };
 	return {
 		config: {
-			bin: env.PI_LIGHTPANDA_BIN?.trim() || "lightpanda",
 			host: host === "localhost" ? "127.0.0.1" : host,
 			port,
 			timeoutMs,
@@ -105,6 +109,18 @@ function readConfig(env: NodeJS.ProcessEnv = process.env): { config: LightpandaC
 			maxRefs,
 		},
 	};
+}
+
+/**
+ * Binary resolution at call time (not load time): PI_LIGHTPANDA_BIN, then the
+ * /lightpanda setup install path, then PATH. Dynamic so a successful
+ * /lightpanda setup works immediately, without restarting Pi.
+ */
+function resolveBin(env: NodeJS.ProcessEnv = process.env, installedPath = defaultBinPath(), exists: (p: string) => boolean = existsSync): string {
+	const fromEnv = env.PI_LIGHTPANDA_BIN?.trim();
+	if (fromEnv) return fromEnv;
+	if (exists(installedPath)) return installedPath;
+	return "lightpanda";
 }
 
 // --- small pure helpers (tested) -------------------------------------------
@@ -196,14 +212,6 @@ function collectSnapshot(maxRefs: number, maxBytes: number): { refs: SnapshotRef
 
 // --- binary + server lifecycle ----------------------------------------------
 
-function binaryVersion(bin: string): string | null {
-	try {
-		return execFileSync(bin, ["version"], { encoding: "utf8", timeout: 10_000 }).trim().split("\n")[0] ?? null;
-	} catch {
-		return null;
-	}
-}
-
 function endpointUrl(config: LightpandaConfig): string {
 	const host = config.host.includes(":") ? `[${config.host}]` : config.host;
 	return `ws://${host}:${config.port}`;
@@ -246,13 +254,14 @@ async function ensureServer(config: LightpandaConfig): Promise<{ reused: boolean
 		return { error: `the managed lightpanda server on port ${config.port} is not responding` };
 	}
 	let child: ChildProcess;
+	const bin = resolveBin();
 	try {
-		child = spawn(config.bin, ["serve", "--host", config.host, "--port", String(config.port)], {
+		child = spawn(bin, ["serve", "--host", config.host, "--port", String(config.port)], {
 			stdio: "ignore",
 			detached: process.platform !== "win32",
 		});
 	} catch (err) {
-		return { error: `could not spawn "${config.bin} serve" — is lightpanda installed? (run npx pi-lightpanda-setup): ${err instanceof Error ? err.message : String(err)}` };
+		return { error: `could not spawn "${bin} serve" — is lightpanda installed? (run /lightpanda setup): ${err instanceof Error ? err.message : String(err)}` };
 	}
 	child.unref();
 	child.on("exit", () => {
@@ -264,7 +273,7 @@ async function ensureServer(config: LightpandaConfig): Promise<{ reused: boolean
 	serverChild = child;
 	serverOurs = true;
 	if (await waitForServer(config, 15_000)) return { reused: false };
-	return { error: `"${config.bin} serve" did not answer on ${config.host}:${config.port} within 15s — is the binary working? Try \`${config.bin} version\`.` };
+	return { error: `"${resolveBin()} serve" did not answer on ${config.host}:${config.port} within 15s — is the binary working? Try \`${resolveBin()} version\`.` };
 }
 
 function stopManagedServer(): boolean {
@@ -342,10 +351,10 @@ function fetchArgs(url: string, format: string, waitMs: number, maxBytes: number
 
 function runFetch(config: LightpandaConfig, url: string, format: string, waitMs: number, maxBytes: number): Promise<{ text: string } | { error: string }> {
 	return new Promise((resolve) => {
-		execFile(config.bin, fetchArgs(url, format, waitMs, maxBytes), { timeout: config.timeoutMs + 10_000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+		execFile(resolveBin(), fetchArgs(url, format, waitMs, maxBytes), { timeout: config.timeoutMs + 10_000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
 			if (err) {
 				const detail = (stderr?.toString().trim() || err.message).slice(0, 500);
-				resolve({ error: `lightpanda fetch failed: ${detail}` });
+				resolve({ error: `lightpanda fetch failed: ${detail}${/ENOENT/.test(detail) ? " — binary not found, run /lightpanda setup" : ""}` });
 				return;
 			}
 			resolve({ text: truncateText(stdout.toString(), maxBytes + TRUNC_MARKER.length) });
@@ -363,6 +372,31 @@ function toolError(err: unknown, what: string): { content: Array<{ type: "text";
 	const msg = err instanceof Error ? err.message : String(err);
 	if (/closed|disconnected|detached|Target closed|Session closed|not connected/i.test(msg)) dropPage();
 	return textResult(`error: ${what}: ${msg.slice(0, 800)}`);
+}
+
+// --- setup command (/lightpanda setup) -----------------------------------------
+
+/** Install/verify the Lightpanda binary, entirely inside Pi — mirrors pi-github-app-auth's wizard pattern. */
+async function runSetupCommand(ctx: ExtensionCommandContext): Promise<void> {
+	if (!ctx.hasUI) {
+		ctx.ui.notify(
+			"lightpanda: the setup wizard needs an interactive session (pi in a terminal). Headless alternative: install the binary yourself (https://lightpanda.io/docs) and set PI_LIGHTPANDA_BIN.",
+			"warning",
+		);
+		return;
+	}
+	const ui: WizardUI = ctx.ui;
+	try {
+		const result = await runSetupWizard(ui);
+		if (!result) return; // cancelled
+		if (result.skipped) {
+			ui.notify(`lightpanda: already usable at ${result.target}${result.version ? ` (${result.version})` : ""} — nothing to do.`, "info");
+		} else {
+			ui.notify(`lightpanda: installed ${result.version} at ${result.target} — tools work immediately, no restart needed (PI_LIGHTPANDA_BIN stays optional).`, "info");
+		}
+	} catch (err) {
+		ui.notify(`lightpanda: setup failed — ${err instanceof Error ? err.message : String(err)}`, "error");
+	}
 }
 
 // --- extension -----------------------------------------------------------------
@@ -531,7 +565,7 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 			if (!p.script.endsWith(".js")) return textResult("error: refusing non-.js script (PandaScript files end in .js)");
 			if (p.script.includes("..")) return textResult("error: refusing path with ..");
 			const out: { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } = await new Promise((resolve) => {
-				execFile(cfg.bin, ["run", p.script], { timeout: cfg.timeoutMs + 10_000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+				execFile(resolveBin(), ["run", p.script], { timeout: cfg.timeoutMs + 10_000, maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
 					if (err) {
 						resolve(textResult(`error: lightpanda run failed: ${(stderr?.toString().trim() || err.message).slice(0, 800)}`));
 						return;
@@ -554,7 +588,7 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("lightpanda", {
-		description: "Lightweight browser — subcommands: status | start | stop",
+		description: "Lightweight browser — subcommands: status | start | stop | setup",
 		handler: async (args, ctx) => {
 			const sub = parseSubcommand(args) || "status";
 			if (sub === "status") {
@@ -565,8 +599,10 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 			} else if (sub === "stop") {
 				await closePage().catch(() => {});
 				ctx.ui.notify(stopManagedServer() ? "lightpanda: managed server stopped" : "lightpanda: no managed server to stop (external servers are left alone)", "info");
+			} else if (sub === "setup") {
+				await runSetupCommand(ctx);
 			} else {
-				ctx.ui.notify(`lightpanda: unknown subcommand "${sub}" — try /lightpanda status`, "warning");
+				ctx.ui.notify(`lightpanda: unknown subcommand "${sub}" — try /lightpanda status or /lightpanda setup`, "warning");
 			}
 		},
 	});
@@ -578,7 +614,9 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 }
 
 async function statusText(config: LightpandaConfig): Promise<string> {
-	const version = binaryVersion(config.bin);
+	const bin = resolveBin();
+	const check = binaryUsable(bin);
+	const version = check.usable ? check.version || "unknown version" : null;
 	const probe = await probeServer(config);
 	let pageLine = "page: —";
 	if (isPageAlive()) {
@@ -589,7 +627,7 @@ async function statusText(config: LightpandaConfig): Promise<string> {
 		}
 	}
 	return [
-		`binary: ${config.bin}${version ? ` (${version})` : " (not found — run npx pi-lightpanda-setup)"}`,
+		`binary: ${bin}${version ? ` (${version})` : " (not found — run /lightpanda setup)"}`,
 		`server: ${config.host}:${config.port} — ${probe.ok ? `up${probe.version ? ` (${probe.version})` : ""}${serverOurs ? " (managed)" : " (external)"}` : "down"}`,
 		pageLine,
 		"note: partial Web API coverage, no screenshots — use Chromium-backed tools for complex sites",
@@ -599,6 +637,7 @@ async function statusText(config: LightpandaConfig): Promise<string> {
 // Exposed for self-check scripts only; pi itself only uses the default export.
 export const _internals = {
 	readConfig,
+	resolveBin,
 	parseSubcommand,
 	truncateText,
 	isHttpUrl,

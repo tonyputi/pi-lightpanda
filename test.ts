@@ -7,7 +7,7 @@ import assert from "node:assert";
 import { _internals } from "./index.ts";
 import { _setupInternals } from "./setup.ts";
 
-const { readConfig, parseSubcommand, truncateText, isHttpUrl, formatSnapshot, collectSnapshot, fetchArgs, endpointUrl, TRUNC_MARKER, LOOPBACK_HOSTS } = _internals;
+const { readConfig, resolveBin, parseSubcommand, truncateText, isHttpUrl, formatSnapshot, collectSnapshot, fetchArgs, endpointUrl, TRUNC_MARKER, LOOPBACK_HOSTS } = _internals;
 
 // --- readConfig -----------------------------------------------------------
 {
@@ -17,7 +17,6 @@ const { readConfig, parseSubcommand, truncateText, isHttpUrl, formatSnapshot, co
 
 	const d = readConfig();
 	assert.ok(d.config && !d.error, "defaults accepted");
-	assert.equal(d.config!.bin, "lightpanda");
 	assert.equal(d.config!.host, "127.0.0.1");
 	assert.equal(d.config!.port, 9222);
 
@@ -45,12 +44,18 @@ const { readConfig, parseSubcommand, truncateText, isHttpUrl, formatSnapshot, co
 	assert.ok(readConfig().error, "zero maxBytes rejected");
 	delete process.env.PI_LIGHTPANDA_MAX_BYTES;
 
-	process.env.PI_LIGHTPANDA_BIN = "/custom/lightpanda";
-	assert.equal(readConfig().config!.bin, "/custom/lightpanda", "custom bin kept");
-	delete process.env.PI_LIGHTPANDA_BIN;
-
 	for (const [k, v] of keep) if (v !== undefined) process.env[k] = v;
 	console.log("ok readConfig");
+}
+
+// --- resolveBin ------------------------------------------------------------
+{
+	const fakeExists = (p: string) => p === "/installed/lightpanda";
+	assert.equal(resolveBin({}, "/installed/lightpanda", fakeExists), "/installed/lightpanda", "install path picked when present");
+	assert.equal(resolveBin({}, "/installed/lightpanda", () => false), "lightpanda", "PATH fallback when not installed");
+	assert.equal(resolveBin({ PI_LIGHTPANDA_BIN: "/env/lp" }, "/installed/lightpanda", fakeExists), "/env/lp", "env wins over install path");
+	assert.equal(resolveBin({ PI_LIGHTPANDA_BIN: "   " }, "/installed/lightpanda", fakeExists), "/installed/lightpanda", "blank env ignored");
+	console.log("ok resolveBin");
 }
 
 // --- parseSubcommand ------------------------------------------------------
@@ -142,14 +147,7 @@ const { readConfig, parseSubcommand, truncateText, isHttpUrl, formatSnapshot, co
 
 // --- setup (pure parts; download flow is manual) ---------------------------
 {
-	const { parseArgs, assetName, defaultBinPath, downloadUrl, formatEnvrc, checkNodeVersion, binaryUsable } = _setupInternals;
-
-	assert.deepEqual(parseArgs([]), {});
-	assert.deepEqual(parseArgs(["--bin", "/tmp/lp"]), { binPath: "/tmp/lp" });
-	assert.deepEqual(parseArgs(["--envrc", "/tmp/e", "--check"]), { envrcPath: "/tmp/e", check: true });
-	assert.deepEqual(parseArgs(["--help"]), { help: true });
-	assert.throws(() => parseArgs(["--bogus"]), /unknown argument/);
-	assert.throws(() => parseArgs(["--bin"]), /missing value/);
+	const { assetName, defaultBinPath, downloadUrl, binaryUsable, installTarget, runSetupWizard } = _setupInternals;
 
 	assert.equal(assetName("darwin", "arm64"), "lightpanda-aarch64-macos");
 	assert.equal(assetName("darwin", "x64"), "lightpanda-x86_64-macos");
@@ -161,15 +159,45 @@ const { readConfig, parseSubcommand, truncateText, isHttpUrl, formatSnapshot, co
 	assert.ok(defaultBinPath().endsWith(joinParts(".pi", "agent", "bin", "lightpanda")), "default under ~/.pi/agent/bin");
 	assert.ok(downloadUrl("lightpanda-x86_64-linux").startsWith("https://github.com/lightpanda-io/browser/releases/download/nightly/"), "release URL sane");
 
-	const block = formatEnvrc("/x/lightpanda");
-	assert.ok(block.includes('PI_LIGHTPANDA_BIN="/x/lightpanda"'), "envrc block names the var");
-
-	checkNodeVersion(process.versions.node);
-	assert.throws(() => checkNodeVersion("20.11.0"), /too old/);
-	assert.throws(() => checkNodeVersion("22.17.9"), /too old/);
-	assert.throws(() => checkNodeVersion("garbage"), /too old/);
+	assert.equal(installTarget({}), defaultBinPath(), "no env -> default install path");
+	assert.equal(installTarget({ PI_LIGHTPANDA_BIN: "/x/lp" }), "/x/lp", "env -> install there");
+	assert.equal(installTarget({ PI_LIGHTPANDA_BIN: "   " }), defaultBinPath(), "blank env -> default");
 
 	assert.equal(binaryUsable("/definitely/not/here-lightpanda").usable, false, "missing binary -> unusable");
+
+	// The wizard, with a fake ui (same shape as pi's ctx.ui).
+	const makeUi = (confirmResult: boolean) => {
+		const calls: string[] = [];
+		return {
+			calls,
+			ui: {
+				confirm: async () => {
+					calls.push("confirm");
+					return confirmResult;
+				},
+				notify: (message: string) => {
+					calls.push(`notify:${message}`);
+				},
+			},
+		};
+	};
+
+	await assert.rejects(
+		() => runSetupWizard(makeUi(true).ui, { platform: "win32", arch: "x64" }),
+		/unsupported platform/,
+		"windows refused",
+	);
+
+	// A usable binary short-circuits before any download.
+	const up = makeUi(true);
+	const done = await runSetupWizard(up.ui, { env: { PI_LIGHTPANDA_BIN: "/bin/true" } as NodeJS.ProcessEnv });
+	assert.ok(done && done.skipped && done.target === "/bin/true", "usable binary -> skipped, no download");
+	assert.equal(up.calls.length, 0, "skipped flow asks nothing");
+
+	const no = makeUi(false);
+	assert.equal(await runSetupWizard(no.ui, { env: { PI_LIGHTPANDA_BIN: "/bin/false" } as NodeJS.ProcessEnv }), null, "declined download -> null");
+	assert.ok(no.calls.some((c) => c.startsWith("notify:lightpanda: setup cancelled")), "cancel is reported");
+
 	console.log("ok setup");
 }
 
