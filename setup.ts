@@ -25,6 +25,7 @@ const RELEASE_BASE = `https://github.com/${REPO}/releases/download/${NIGHTLY_TAG
 export interface WizardUI {
 	confirm(title: string, message: string, opts?: { signal?: AbortSignal; timeout?: number }): Promise<boolean>;
 	notify(message: string, type?: "info" | "warning" | "error"): void;
+	setStatus?(key: string, text: string | undefined): void;
 }
 
 export interface SetupResult {
@@ -72,15 +73,46 @@ export function binaryUsable(bin: string): { usable: boolean; version?: string }
 	}
 }
 
-export async function downloadBinary(url: string, dest: string): Promise<void> {
+export function formatDownloadProgress(downloadedBytes: number, totalBytes?: number): string {
+	const downloadedMb = (downloadedBytes / (1024 * 1024)).toFixed(1);
+	if (totalBytes && totalBytes > 0) {
+		const totalMb = (totalBytes / (1024 * 1024)).toFixed(1);
+		const percent = Math.min(100, Math.floor((downloadedBytes / totalBytes) * 100));
+		return `Downloading Lightpanda: ${downloadedMb} / ${totalMb} MB (${percent}%)`;
+	}
+	return `Downloading Lightpanda: ${downloadedMb} MB`;
+}
+
+export async function downloadBinary(url: string, dest: string, onProgress?: (downloadedBytes: number, totalBytes?: number) => void): Promise<void> {
 	const res = await fetch(url, { redirect: "follow" });
 	if (!res.ok || !res.body) throw new Error(`download failed: HTTP ${res.status} — check https://github.com/${REPO}/releases`);
-	mkdirSync(dirname(dest), { recursive: true });
-	const buf = Buffer.from(await res.arrayBuffer());
-	if (buf.length < 1024 * 1024) {
-		// A real binary is tens of MB; anything smaller is an error page.
-		throw new Error(`downloaded file suspiciously small (${buf.length} bytes) — the nightly asset may be missing`);
+
+	const contentLength = Number(res.headers.get("content-length"));
+	const totalBytes = Number.isFinite(contentLength) && contentLength > 0 ? contentLength : undefined;
+	const reader = res.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let downloadedBytes = 0;
+	let lastUpdate = 0;
+	onProgress?.(0, totalBytes);
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		chunks.push(value);
+		downloadedBytes += value.byteLength;
+		const now = Date.now();
+		if (now - lastUpdate >= 400) {
+			onProgress?.(downloadedBytes, totalBytes);
+			lastUpdate = now;
+		}
 	}
+	onProgress?.(downloadedBytes, totalBytes);
+
+	if (downloadedBytes < 1024 * 1024) {
+		// A real binary is tens of MB; anything smaller is an error page.
+		throw new Error(`downloaded file suspiciously small (${downloadedBytes} bytes) — the nightly asset may be missing`);
+	}
+	mkdirSync(dirname(dest), { recursive: true });
+	const buf = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), downloadedBytes);
 	writeFileSync(dest, buf, { mode: 0o755 });
 	chmodSync(dest, 0o755);
 }
@@ -116,8 +148,16 @@ export async function runSetupWizard(
 		ui.notify("lightpanda: setup cancelled.", "info");
 		return null;
 	}
-	ui.notify(`lightpanda: downloading ${asset} … (tens of MB, a moment)`, "info");
-	await downloadBinary(downloadUrl(asset), target);
+	ui.notify(`lightpanda: downloading ${asset} …`, "info");
+	const statusKey = "pi-lightpanda-setup";
+	try {
+		ui.setStatus?.(statusKey, formatDownloadProgress(0));
+		await downloadBinary(downloadUrl(asset), target, (downloaded, total) => {
+			ui.setStatus?.(statusKey, formatDownloadProgress(downloaded, total));
+		});
+	} finally {
+		ui.setStatus?.(statusKey, undefined);
+	}
 	const check = binaryUsable(target);
 	if (!check.usable) {
 		throw new Error(`installed to ${target} but \`lightpanda version\` does not run — wrong platform asset or missing system libs?`);
@@ -128,6 +168,7 @@ export async function runSetupWizard(
 // Exposed for self-check scripts only; pi itself uses the wizard via index.ts.
 export const _setupInternals = {
 	assetName,
+	formatDownloadProgress,
 	defaultBinPath,
 	installTarget,
 	downloadUrl,

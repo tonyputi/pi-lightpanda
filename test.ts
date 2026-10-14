@@ -4,6 +4,9 @@
  * types natively).
  */
 import assert from "node:assert";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { _internals } from "./index.ts";
 import { _setupInternals } from "./setup.ts";
 
@@ -147,7 +150,7 @@ const { readConfig, resolveBin, parseSubcommand, truncateText, isHttpUrl, format
 
 // --- setup (pure parts; download flow is manual) ---------------------------
 {
-	const { assetName, defaultBinPath, downloadUrl, binaryUsable, installTarget, runSetupWizard } = _setupInternals;
+	const { assetName, defaultBinPath, downloadUrl, binaryUsable, installTarget, runSetupWizard, formatDownloadProgress, downloadBinary } = _setupInternals;
 
 	assert.equal(assetName("darwin", "arm64"), "lightpanda-aarch64-macos");
 	assert.equal(assetName("darwin", "x64"), "lightpanda-x86_64-macos");
@@ -164,6 +167,32 @@ const { readConfig, resolveBin, parseSubcommand, truncateText, isHttpUrl, format
 	assert.equal(installTarget({ PI_LIGHTPANDA_BIN: "   " }), defaultBinPath(), "blank env -> default");
 
 	assert.equal(binaryUsable("/definitely/not/here-lightpanda").usable, false, "missing binary -> unusable");
+	assert.equal(formatDownloadProgress(0), "Downloading Lightpanda: 0.0 MB");
+	assert.equal(formatDownloadProgress(5 * 1024 * 1024, 20 * 1024 * 1024), "Downloading Lightpanda: 5.0 / 20.0 MB (25%)");
+
+	// Fake a streamed binary response: progress is reported and output is executable.
+	const originalFetch = globalThis.fetch;
+	const tempDir = mkdtempSync(join(tmpdir(), "pi-lightpanda-test-"));
+	const dest = join(tempDir, "lightpanda");
+	const total = 1024 * 1024;
+	globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(new Uint8Array(600 * 1024));
+			controller.enqueue(new Uint8Array(424 * 1024));
+			controller.close();
+		},
+	}), { headers: { "content-length": String(total) } })) as typeof fetch;
+	try {
+		const progress: Array<[number, number | undefined]> = [];
+		await downloadBinary("https://example.invalid/lightpanda", dest, (downloaded, size) => progress.push([downloaded, size]));
+		assert.equal(statSync(dest).size, total, "stream saved completely");
+		assert.equal(statSync(dest).mode & 0o777, 0o755, "download made executable");
+		assert.deepEqual(progress[0], [0, total], "initial progress includes total size");
+		assert.deepEqual(progress.at(-1), [total, total], "final progress reaches 100%");
+	} finally {
+		globalThis.fetch = originalFetch;
+		rmSync(tempDir, { recursive: true, force: true });
+	}
 
 	// The wizard, with a fake ui (same shape as pi's ctx.ui).
 	const makeUi = (confirmResult: boolean) => {

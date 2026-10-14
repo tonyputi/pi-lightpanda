@@ -72,7 +72,8 @@ pi install npm:pi-lightpanda   # then start pi and run:
 
 What happens: confirm the download → the right nightly binary for your
 platform is fetched from the `lightpanda-io/browser` GitHub releases into
-`~/.pi/agent/bin/lightpanda` and verified with `lightpanda version` → done.
+`~/.pi/agent/bin/lightpanda` (download progress appears in Pi's status line)
+and verified with `lightpanda version` → done.
 The extension resolves the binary dynamically (see Configuration), so the
 tools work immediately — no restart, no `.envrc`. Check any time with
 `/lightpanda status`.
