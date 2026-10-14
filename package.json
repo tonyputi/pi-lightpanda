@@ -23,9 +23,6 @@
       "./index.ts"
     ]
   },
-  "bin": {
-    "pi-lightpanda-setup": "setup.ts"
-  },
   "files": [
     "index.ts",
     "setup.ts",
@@ -33,13 +30,14 @@
     "LICENSE"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.0.2",
+    "@earendil-works/pi-coding-agent": "^1.2.0",
     "@semantic-release/changelog": "^7.0.0",
     "@semantic-release/git": "^11.0.1",
-    "@types/node": "^26.6.4",
+    "@types/node": "^26.6.5",
     "semantic-release": "^25.0.9",
     "typescript": "^7.0.2"
   },
@@ -60,7 +58,6 @@
     ]
   },
   "dependencies": {
-    "puppeteer-core": "^25.0.0",
-    "typebox": "^1.3.27"
+    "puppeteer-core": "^25.0.0"
   }
 }
