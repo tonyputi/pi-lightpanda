@@ -12,14 +12,17 @@
  * written is the binary itself.
  */
 
-import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmodSync, createReadStream, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, platform as osPlatform, arch as osArch } from "node:os";
 import { dirname, join } from "node:path";
 
 const REPO = "lightpanda-io/browser";
 const NIGHTLY_TAG = "nightly";
 const RELEASE_BASE = `https://github.com/${REPO}/releases/download/${NIGHTLY_TAG}`;
+const RELEASE_API = `https://api.github.com/repos/${REPO}/releases/tags/${NIGHTLY_TAG}`;
+const UPDATE_CHECK_TIMEOUT_MS = 3000;
 
 /** Minimal UI surface the wizard needs (structurally pi's ctx.ui). */
 export interface WizardUI {
@@ -83,7 +86,7 @@ export function formatDownloadProgress(downloadedBytes: number, totalBytes?: num
 	return `Downloading Lightpanda: ${downloadedMb} MB`;
 }
 
-export async function downloadBinary(url: string, dest: string, onProgress?: (downloadedBytes: number, totalBytes?: number) => void): Promise<void> {
+export async function downloadBinary(url: string, dest: string, onProgress?: (downloadedBytes: number, totalBytes?: number) => void): Promise<string> {
 	const res = await fetch(url, { redirect: "follow" });
 	if (!res.ok || !res.body) throw new Error(`download failed: HTTP ${res.status} — check https://github.com/${REPO}/releases`);
 
@@ -115,6 +118,114 @@ export async function downloadBinary(url: string, dest: string, onProgress?: (do
 	const buf = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), downloadedBytes);
 	writeFileSync(dest, buf, { mode: 0o755 });
 	chmodSync(dest, 0o755);
+	return createHash("sha256").update(buf).digest("hex");
+}
+
+/** GitHub metadata for the current platform's nightly executable asset. */
+export interface LatestAssetInfo {
+	sha256: string;
+	updatedAt: string;
+}
+
+export type UpdateCheckResult =
+	| { status: "missing" }
+	| { status: "current"; binaryPath: string; updatedAt: string }
+	| { status: "update"; binaryPath: string; target: string; updatedAt: string };
+
+/** Look up the published asset digest; the API call is bounded and read-only. */
+export async function fetchLatestAssetInfo(asset: string, fetcher: typeof fetch = fetch): Promise<LatestAssetInfo> {
+	const response = await fetcher(RELEASE_API, {
+		headers: { accept: "application/vnd.github+json", "user-agent": "pi-lightpanda" },
+		signal: AbortSignal.timeout(UPDATE_CHECK_TIMEOUT_MS),
+	});
+	if (!response.ok) throw new Error(`GitHub release API returned HTTP ${response.status}`);
+	const release = (await response.json()) as { assets?: Array<{ name?: unknown; digest?: unknown; updated_at?: unknown }> };
+	const found = release.assets?.find((item) => item.name === asset);
+	const digest = typeof found?.digest === "string" ? found.digest.match(/^sha256:([a-f0-9]{64})$/i)?.[1]?.toLowerCase() : undefined;
+	if (!digest || typeof found?.updated_at !== "string") throw new Error(`release asset metadata unavailable for ${asset}`);
+	return { sha256: digest, updatedAt: found.updated_at };
+}
+
+export function sha256File(path: string): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const hash = createHash("sha256");
+		const stream = createReadStream(path);
+		stream.on("data", (chunk: Buffer) => hash.update(chunk));
+		stream.on("error", reject);
+		stream.on("end", () => resolve(hash.digest("hex")));
+	});
+}
+
+function findOnPath(): Promise<string | null> {
+	return new Promise((resolve) => {
+		const command = process.platform === "win32" ? "where" : "which";
+		execFile(command, ["lightpanda"], { timeout: 1500 }, (err, stdout) => {
+			const path = err ? "" : stdout.toString().split(/\r?\n/)[0]?.trim() ?? "";
+			resolve(path && existsSync(path) ? path : null);
+		});
+	});
+}
+
+export async function findInstalledBinary(env: NodeJS.ProcessEnv = process.env): Promise<string | null> {
+	const configured = env.PI_LIGHTPANDA_BIN?.trim();
+	if (configured) return existsSync(configured) ? configured : null;
+	const installed = defaultBinPath();
+	if (existsSync(installed)) return installed;
+	return findOnPath();
+}
+
+/** Compare the installed executable with the platform asset's published SHA-256. */
+export async function checkForUpdate(
+	opts: { env?: NodeJS.ProcessEnv; platform?: string; arch?: string; fetcher?: typeof fetch } = {},
+): Promise<UpdateCheckResult> {
+	const binaryPath = await findInstalledBinary(opts.env);
+	if (!binaryPath) return { status: "missing" };
+	const asset = assetName(opts.platform ?? osPlatform(), opts.arch ?? osArch());
+	if (!asset) throw new Error(`unsupported platform ${opts.platform ?? osPlatform()}/${opts.arch ?? osArch()}`);
+	const [localDigest, latest] = await Promise.all([
+		sha256File(binaryPath),
+		fetchLatestAssetInfo(asset, opts.fetcher),
+	]);
+	if (localDigest === latest.sha256) return { status: "current", binaryPath, updatedAt: latest.updatedAt };
+	return { status: "update", binaryPath, target: installTarget(opts.env), updatedAt: latest.updatedAt };
+}
+
+/** Download, verify the release digest and executable, then atomically replace the installed binary. */
+export async function runUpdateWizard(
+	ui: WizardUI,
+	opts: { env?: NodeJS.ProcessEnv; platform?: string; arch?: string; fetcher?: typeof fetch } = {},
+): Promise<Exclude<UpdateCheckResult, { status: "update" }> | { status: "updated"; target: string; version: string } | null> {
+	const result = await checkForUpdate(opts);
+	if (result.status === "missing") return result;
+	if (result.status === "current") return result;
+	const asset = assetName(opts.platform ?? osPlatform(), opts.arch ?? osArch())!;
+	const confirmed = await ui.confirm(
+		"lightpanda — update",
+		`A newer Lightpanda nightly asset is available (published ${result.updatedAt}). Replace ${result.binaryPath} with the verified build at ${result.target}?`,
+	);
+	if (!confirmed) {
+		ui.notify("lightpanda: update cancelled.", "info");
+		return null;
+	}
+	const tempPath = `${result.target}.download-${process.pid}-${Date.now()}`;
+	const statusKey = "pi-lightpanda-update";
+	ui.notify(`lightpanda: downloading update ${asset} …`, "info");
+	try {
+		ui.setStatus?.(statusKey, formatDownloadProgress(0));
+		const downloadedDigest = await downloadBinary(downloadUrl(asset), tempPath, (downloaded, total) => {
+			ui.setStatus?.(statusKey, formatDownloadProgress(downloaded, total));
+		});
+		const latest = await fetchLatestAssetInfo(asset, opts.fetcher);
+		if (downloadedDigest !== latest.sha256) throw new Error("downloaded asset digest does not match GitHub release metadata");
+		const verified = binaryUsable(tempPath);
+		if (!verified.usable) throw new Error("downloaded nightly did not pass `lightpanda version`; original binary was left in place");
+		renameSync(tempPath, result.target);
+		chmodSync(result.target, 0o755);
+		return { status: "updated", target: result.target, version: verified.version ?? "unknown version" };
+	} finally {
+		ui.setStatus?.(statusKey, undefined);
+		rmSync(tempPath, { force: true });
+	}
 }
 
 /**
@@ -175,4 +286,9 @@ export const _setupInternals = {
 	binaryUsable,
 	downloadBinary,
 	runSetupWizard,
+	fetchLatestAssetInfo,
+	sha256File,
+	findInstalledBinary,
+	checkForUpdate,
+	runUpdateWizard,
 };

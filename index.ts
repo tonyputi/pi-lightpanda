@@ -55,7 +55,7 @@ import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
 import { Type } from "typebox";
-import { binaryUsable, defaultBinPath, runSetupWizard, type WizardUI } from "./setup.ts";
+import { binaryUsable, checkForUpdate, defaultBinPath, runSetupWizard, runUpdateWizard, type WizardUI } from "./setup.ts";
 
 // --- config ----------------------------------------------------------------
 
@@ -399,6 +399,46 @@ async function runSetupCommand(ctx: ExtensionCommandContext): Promise<void> {
 	}
 }
 
+/** Check releases in the background: network/API errors are intentionally silent. */
+let startupUpdateCheckStarted = false;
+function startBackgroundUpdateCheck(ctx: { hasUI: boolean; ui: Pick<WizardUI, "notify"> }): void {
+	if (!ctx.hasUI || startupUpdateCheckStarted) return;
+	startupUpdateCheckStarted = true;
+	void checkForUpdate()
+		.then((result) => {
+			if (result.status === "update") {
+				ctx.ui.notify(
+					`lightpanda: a newer nightly build is available (published ${new Date(result.updatedAt).toLocaleDateString()}). Run /lightpanda update to review and install it.`,
+					"info",
+				);
+			}
+		})
+		.catch(() => {
+			// Offline, rate-limited, or unsupported metadata: never delay or warn at startup.
+		});
+}
+
+async function runUpdateCommand(ctx: ExtensionCommandContext): Promise<void> {
+	if (!ctx.hasUI) {
+		ctx.ui.notify("lightpanda: update needs an interactive session so you can confirm replacing the binary.", "warning");
+		return;
+	}
+	const ui: WizardUI = ctx.ui;
+	try {
+		const result = await runUpdateWizard(ui);
+		if (!result) return; // cancelled
+		if (result.status === "missing") {
+			ui.notify("lightpanda: no installed binary found — run /lightpanda setup first.", "warning");
+		} else if (result.status === "current") {
+			ui.notify(`lightpanda: already up to date (${result.binaryPath}).`, "info");
+		} else {
+			ui.notify(`lightpanda: updated to ${result.version} at ${result.target}.`, "info");
+		}
+	} catch (err) {
+		ui.notify(`lightpanda: update failed — ${err instanceof Error ? err.message : String(err)}`, "error");
+	}
+}
+
 // --- extension -----------------------------------------------------------------
 
 export default function piLightpanda(pi: ExtensionAPI): void {
@@ -588,7 +628,7 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("lightpanda", {
-		description: "Lightweight browser — subcommands: status | start | stop | setup",
+		description: "Lightweight browser — subcommands: status | start | stop | setup | update",
 		handler: async (args, ctx) => {
 			const sub = parseSubcommand(args) || "status";
 			if (sub === "status") {
@@ -601,10 +641,16 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 				ctx.ui.notify(stopManagedServer() ? "lightpanda: managed server stopped" : "lightpanda: no managed server to stop (external servers are left alone)", "info");
 			} else if (sub === "setup") {
 				await runSetupCommand(ctx);
+			} else if (sub === "update") {
+				await runUpdateCommand(ctx);
 			} else {
-				ctx.ui.notify(`lightpanda: unknown subcommand "${sub}" — try /lightpanda status or /lightpanda setup`, "warning");
+				ctx.ui.notify(`lightpanda: unknown subcommand "${sub}" — try /lightpanda status, setup, or update`, "warning");
 			}
 		},
+	});
+
+	pi.on("session_start", (_event, ctx) => {
+		startBackgroundUpdateCheck(ctx);
 	});
 
 	pi.on("session_shutdown", () => {

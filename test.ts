@@ -4,7 +4,8 @@
  * types natively).
  */
 import assert from "node:assert";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _internals } from "./index.ts";
@@ -150,7 +151,19 @@ const { readConfig, resolveBin, parseSubcommand, truncateText, isHttpUrl, format
 
 // --- setup (pure parts; download flow is manual) ---------------------------
 {
-	const { assetName, defaultBinPath, downloadUrl, binaryUsable, installTarget, runSetupWizard, formatDownloadProgress, downloadBinary } = _setupInternals;
+	const {
+		assetName,
+		defaultBinPath,
+		downloadUrl,
+		binaryUsable,
+		installTarget,
+		runSetupWizard,
+		formatDownloadProgress,
+		downloadBinary,
+		fetchLatestAssetInfo,
+		checkForUpdate,
+		runUpdateWizard,
+	} = _setupInternals;
 
 	assert.equal(assetName("darwin", "arm64"), "lightpanda-aarch64-macos");
 	assert.equal(assetName("darwin", "x64"), "lightpanda-x86_64-macos");
@@ -192,6 +205,83 @@ const { readConfig, resolveBin, parseSubcommand, truncateText, isHttpUrl, format
 	} finally {
 		globalThis.fetch = originalFetch;
 		rmSync(tempDir, { recursive: true, force: true });
+	}
+
+	// Release metadata and update comparison are tested against a local fake binary/API.
+	const updateDir = mkdtempSync(join(tmpdir(), "pi-lightpanda-update-test-"));
+	const installedPath = join(updateDir, "lightpanda");
+	const installedBytes = Buffer.from("installed nightly fixture");
+	writeFileSync(installedPath, installedBytes);
+	const installedDigest = createHash("sha256").update(installedBytes).digest("hex");
+	const asset = "lightpanda-x86_64-linux";
+	const releaseFetch = (digest: string): typeof fetch => (async () =>
+		new Response(JSON.stringify({ assets: [{ name: asset, digest: `sha256:${digest}`, updated_at: "2026-10-14T00:00:00Z" }] }), {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		})
+	) as typeof fetch;
+	try {
+		assert.deepEqual(await fetchLatestAssetInfo(asset, releaseFetch(installedDigest)), {
+			sha256: installedDigest,
+			updatedAt: "2026-10-14T00:00:00Z",
+		});
+		const current = await checkForUpdate({
+			env: { PI_LIGHTPANDA_BIN: installedPath } as NodeJS.ProcessEnv,
+			platform: "linux",
+			arch: "x64",
+			fetcher: releaseFetch(installedDigest),
+		});
+		assert.equal(current.status, "current", "matching digest is up to date");
+		const update = await checkForUpdate({
+			env: { PI_LIGHTPANDA_BIN: installedPath } as NodeJS.ProcessEnv,
+			platform: "linux",
+			arch: "x64",
+			fetcher: releaseFetch("f".repeat(64)),
+		});
+		assert.ok(update.status === "update" && update.target === installedPath, "different digest signals update");
+		const alreadyCurrent = await runUpdateWizard(
+			{ confirm: async () => false, notify: () => {} },
+			{ env: { PI_LIGHTPANDA_BIN: installedPath } as NodeJS.ProcessEnv, platform: "linux", arch: "x64", fetcher: releaseFetch(installedDigest) },
+		);
+		assert.ok(alreadyCurrent?.status === "current", "update command reports current without prompting");
+		let prompted = false;
+		const declined = await runUpdateWizard(
+			{ confirm: async () => { prompted = true; return false; }, notify: () => {} },
+			{ env: { PI_LIGHTPANDA_BIN: installedPath } as NodeJS.ProcessEnv, platform: "linux", arch: "x64", fetcher: releaseFetch("f".repeat(64)) },
+		);
+		assert.equal(prompted, true, "update command asks before replacing the binary");
+		assert.equal(declined, null, "declined update does not replace the binary");
+
+		const newBytes = Buffer.concat([
+			Buffer.from("#!/bin/sh\necho lightpanda-update-fixture\n#"),
+			Buffer.alloc(1024 * 1024, 0x78),
+		]);
+		const newDigest = createHash("sha256").update(newBytes).digest("hex");
+		writeFileSync(installedPath, "#!/bin/sh\necho old-lightpanda\n", { mode: 0o755 });
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () => new Response(new Uint8Array(newBytes), {
+			status: 200,
+			headers: { "content-length": String(newBytes.length) },
+		})) as typeof fetch;
+		const statusUpdates: Array<string | undefined> = [];
+		try {
+			const applied = await runUpdateWizard(
+				{
+					confirm: async () => true,
+					notify: () => {},
+					setStatus: (_key, text) => statusUpdates.push(text),
+				},
+				{ env: { PI_LIGHTPANDA_BIN: installedPath } as NodeJS.ProcessEnv, platform: "linux", arch: "x64", fetcher: releaseFetch(newDigest) },
+			);
+			assert.ok(applied?.status === "updated" && applied.version === "lightpanda-update-fixture", "confirmed update is installed and verified");
+			assert.equal(await _setupInternals.sha256File(installedPath), newDigest, "verified update replaced old binary atomically");
+			assert.equal(statusUpdates.at(-1), undefined, "update progress status is cleared");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+		await assert.rejects(() => fetchLatestAssetInfo(asset, releaseFetch("not-a-digest")), /metadata unavailable/);
+	} finally {
+		rmSync(updateDir, { recursive: true, force: true });
 	}
 
 	// The wizard, with a fake ui (same shape as pi's ctx.ui).

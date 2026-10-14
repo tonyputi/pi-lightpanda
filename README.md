@@ -34,8 +34,8 @@ else.
 The extension manages the whole lifecycle: one-shot `fetch` for reading pages
 (no server needed), a persistent `serve` + `puppeteer-core` client for multi-step
 interaction (navigate → snapshot → act), and PandaScript `run` for
-reproducible automation. Two runtime dependencies (`typebox` for tool schemas,
-`puppeteer-core` as the Chromium-free CDP client) — no `puppeteer`/`playwright`,
+reproducible automation. `puppeteer-core` is the Chromium-free CDP client;
+`typebox` is provided by Pi as a host peer dependency. No `puppeteer`/`playwright`,
 which would drag a full Chromium download back in.
 
 This is **not** a full Chromium replacement: Lightpanda has partial Web API
@@ -75,8 +75,11 @@ platform is fetched from the `lightpanda-io/browser` GitHub releases into
 `~/.pi/agent/bin/lightpanda` (download progress appears in Pi's status line)
 and verified with `lightpanda version` → done.
 The extension resolves the binary dynamically (see Configuration), so the
-tools work immediately — no restart, no `.envrc`. Check any time with
-`/lightpanda status`.
+tools work immediately — no restart, no `.envrc`. At startup Pi checks the
+installed binary's SHA-256 against the latest GitHub asset in the background
+(once per Pi process); this never delays the session or updates automatically.
+If a newer nightly is available, Pi suggests `/lightpanda update`. Network/API
+errors are silent. Check the installation any time with `/lightpanda status`.
 
 Prefer the manual route? Install from
 [lightpanda.io/docs](https://lightpanda.io/docs) (one-liner, brew, docker,
@@ -137,9 +140,9 @@ Tools (called by the agent): `lightpanda_fetch`, `lightpanda_navigate`,
 `lightpanda_snapshot`, `lightpanda_act` (click/fill/type/select/press/hover),
 `lightpanda_eval`, `lightpanda_run`, `lightpanda_status`.
 
-Command: `/lightpanda status | start | stop | setup` — server health, lifecycle,
-and in-Pi binary install (external servers are never stopped, only ones this
-extension spawned).
+Command: `/lightpanda status | start | stop | setup | update` — server health,
+lifecycle, in-Pi binary install and confirmed updates (external servers are
+never stopped, only ones this extension spawned).
 
 Suggested loop for the agent: `fetch` for reading → `navigate` → `snapshot`
 → `act` → re-`snapshot` → … → `run` to save a working flow as PandaScript.
