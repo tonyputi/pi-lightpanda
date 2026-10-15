@@ -42,7 +42,8 @@
     "typescript": "^7.0.2"
   },
   "scripts": {
-    "test": "node test.ts"
+    "test": "node test.ts && node --test reliability.test.ts",
+    "test:smoke": "node smoke.ts"
   },
   "release": {
     "branches": [

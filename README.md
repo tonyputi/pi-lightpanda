@@ -73,19 +73,31 @@ pi install npm:pi-lightpanda   # then start pi and run:
 What happens: confirm the download → the right nightly binary for your
 platform is fetched from the `lightpanda-io/browser` GitHub releases into
 `~/.pi/agent/bin/lightpanda` (download progress appears in Pi's status line)
-and verified with `lightpanda version` → done.
-The extension resolves the binary dynamically (see Configuration), so the
-tools work immediately — no restart, no `.envrc`. At startup Pi checks the
-installed binary's SHA-256 against the latest GitHub asset in the background
-(once per Pi process); this never delays the session or updates automatically.
-If a newer nightly is available, Pi suggests `/lightpanda update`. Network/API
-errors are silent. Check the installation any time with `/lightpanda status`.
+and verified against GitHub's SHA-256 metadata and with `lightpanda version` → done.
+Setup and update stream to a private temporary directory next to the destination
+and replace the binary atomically only after verification. Downloads have a
+five-minute timeout and a 256 MB safety limit; failures leave the previous binary
+untouched and clean up partial files. Version checks are asynchronous, so a slow
+executable cannot freeze Pi's UI.
+
+The extension resolves the binary dynamically (see Configuration), so CLI tools
+use it immediately — no reload, no `.envrc`. At startup Pi checks the installed
+binary's SHA-256 against the latest GitHub asset in the background (once per
+extension runtime); this never delays the session or updates automatically.
+If the digest differs, Pi suggests `/lightpanda update`. A different digest does
+not prove the build is newer: custom/stable builds may also differ. Network/API
+errors are silent; session shutdown cancels work and suppresses late notifications.
+
+After an update, an already-running CDP server still uses the previous build.
+Pi asks before restarting a **managed** server because restarting discards its
+page, cookies and session state. Declining keeps that server running and explains
+how to restart later with `/lightpanda stop` then `/lightpanda start`. External
+servers are never restarted or stopped. Check any time with `/lightpanda status`.
 
 Prefer the manual route? Install from
 [lightpanda.io/docs](https://lightpanda.io/docs) (one-liner, brew, docker,
 nightly builds) and set `PI_LIGHTPANDA_BIN` if the binary is not on `PATH`.
-Native Windows is unsupported — run inside WSL2 and set `PI_LIGHTPANDA_BIN`
-to the host serving CDP (or install inside WSL and run pi there).
+Native Windows is unsupported — install and run both Pi and Lightpanda inside WSL2.
 
 ## Configuration
 
@@ -100,12 +112,16 @@ The remaining variables are optional tuning:
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `PI_LIGHTPANDA_BIN` | path to the `lightpanda` binary (optional — see resolution order above) | resolved automatically |
+| `PI_LIGHTPANDA_BIN` | binary path or command name on `PATH` (optional — see resolution order above) | resolved automatically |
 | `PI_LIGHTPANDA_HOST` | CDP host — **loopback only** | `127.0.0.1` |
 | `PI_LIGHTPANDA_PORT` | CDP port | `9222` |
 | `PI_LIGHTPANDA_TIMEOUT_MS` | per-operation timeout | `30000` |
 | `PI_LIGHTPANDA_MAX_BYTES` | max text bytes returned per tool | `12288` |
 | `PI_LIGHTPANDA_MAX_REFS` | max snapshot refs | `50` |
+
+Tools, setup and update share binary resolution, including command-name overrides
+on `PATH`. An override naming a missing command cannot be an install destination:
+set an explicit file path or unset it to use the managed install location.
 
 Example `.envrc` (only if you keep the binary somewhere else):
 
@@ -121,11 +137,20 @@ export PI_LIGHTPANDA_BIN="$HOME/tools/lightpanda"
   `lightpanda serve --host 127.0.0.1 --port 9222` subprocess, spawned on
   first use. An already-running server is reused untouched; a server we
   spawned is killed on `session_shutdown`.
+- Missing/non-executable binaries and servers that exit before readiness return
+  errors instead of crashing Pi. Concurrent startup requests share one child;
+  shutdown waits for a managed child to exit. Our browser context is closed on
+  disconnect, without closing an external browser.
 - The CDP client is `puppeteer-core` (Lightpanda's documented automation path:
   connect over `ws://host:port`, open a context + page). It ships no browser,
   so unlike `puppeteer`/`playwright` it does not drag Chromium back in.
-  Snapshot refs (`e1`, `e2`, …) map to selectors in memory and expire after
-  each act; one persistent page per session keeps logins and state.
+- Snapshot refs (`e1`, `e2`, …) map to unique, temporary DOM attributes, not
+  ambiguous IDs/classes. Identical buttons remain distinct, and DOM reordering
+  does not move a marker to another element. A new snapshot removes old markers.
+  Refs expire after navigation, actions (including failed ones), evaluation,
+  stop or restart; stale or duplicated targets fail safely. Password input values
+  are omitted. CDP tools execute sequentially so they cannot race over the shared
+  page/ref map; one persistent page per session keeps logins and state.
 - `lightpanda_run` executes a trusted `.js` PandaScript file headlessly
   (`lightpanda run`) — reproducible automation without an LLM, same caution
   as running a shell script.
@@ -162,13 +187,34 @@ Run `/lightpanda status` inside Pi.
 
 - **binary … not found** — run `/lightpanda setup`, or set `PI_LIGHTPANDA_BIN`
   to the binary path. No restart needed: resolution happens at every call.
-- **did not answer on 127.0.0.1:9222 within 15s** — the binary may be the
+- **did not answer … within …ms** — the binary may be the
   wrong platform asset or missing system libs; try `<bin> version` manually.
 - **fetch/navigate/eval failures on a specific site** — likely partial Web
   API coverage in Lightpanda; fall back to a Chromium-backed extension for
   that site (no screenshots here by design — no rendering engine).
 - **PI_LIGHTPANDA_HOST must be loopback** — by design; remote CDP endpoints
   are refused.
+
+## Development checks
+
+```bash
+npx tsc --noEmit
+npm test
+```
+
+The default suite requires no network or Lightpanda binary. It uses fake
+executables, HTTP streams and DOM elements to exercise failure paths as well
+as successful installs/updates.
+
+With Lightpanda installed, run the optional integration check:
+
+```bash
+npm run test:smoke
+```
+
+It serves a local fixture on an ephemeral loopback port, verifies real CDP
+snapshots/clicks and stale refs, and checks managed-server cleanup and external
+server preservation. It does not download/update binaries or use external sites.
 
 ## License
 

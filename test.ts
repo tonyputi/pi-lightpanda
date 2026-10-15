@@ -179,7 +179,7 @@ const { readConfig, resolveBin, parseSubcommand, truncateText, isHttpUrl, format
 	assert.equal(installTarget({ PI_LIGHTPANDA_BIN: "/x/lp" }), "/x/lp", "env -> install there");
 	assert.equal(installTarget({ PI_LIGHTPANDA_BIN: "   " }), defaultBinPath(), "blank env -> default");
 
-	assert.equal(binaryUsable("/definitely/not/here-lightpanda").usable, false, "missing binary -> unusable");
+	assert.equal((await binaryUsable("/definitely/not/here-lightpanda")).usable, false, "missing binary -> unusable");
 	assert.equal(formatDownloadProgress(0), "Downloading Lightpanda: 0.0 MB");
 	assert.equal(formatDownloadProgress(5 * 1024 * 1024, 20 * 1024 * 1024), "Downloading Lightpanda: 5.0 / 20.0 MB (25%)");
 
@@ -263,6 +263,9 @@ const { readConfig, resolveBin, parseSubcommand, truncateText, isHttpUrl, format
 			status: 200,
 			headers: { "content-length": String(newBytes.length) },
 		})) as typeof fetch;
+		const updateFetch: typeof fetch = (input, init) => String(input).includes("api.github.com")
+			? releaseFetch(newDigest)(input, init)
+			: globalThis.fetch(input, init);
 		const statusUpdates: Array<string | undefined> = [];
 		try {
 			const applied = await runUpdateWizard(
@@ -271,7 +274,7 @@ const { readConfig, resolveBin, parseSubcommand, truncateText, isHttpUrl, format
 					notify: () => {},
 					setStatus: (_key, text) => statusUpdates.push(text),
 				},
-				{ env: { PI_LIGHTPANDA_BIN: installedPath } as NodeJS.ProcessEnv, platform: "linux", arch: "x64", fetcher: releaseFetch(newDigest) },
+				{ env: { PI_LIGHTPANDA_BIN: installedPath } as NodeJS.ProcessEnv, platform: "linux", arch: "x64", fetcher: updateFetch },
 			);
 			assert.ok(applied?.status === "updated" && applied.version === "lightpanda-update-fixture", "confirmed update is installed and verified");
 			assert.equal(await _setupInternals.sha256File(installedPath), newDigest, "verified update replaced old binary atomically");
