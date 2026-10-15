@@ -26,6 +26,7 @@
   "files": [
     "index.ts",
     "setup.ts",
+    "extract.ts",
     "README.md",
     "LICENSE"
   ],
@@ -42,7 +43,7 @@
     "typescript": "^7.0.2"
   },
   "scripts": {
-    "test": "node test.ts && node --test reliability.test.ts",
+    "test": "node test.ts && node --test reliability.test.ts extraction.test.ts",
     "test:smoke": "node smoke.ts"
   },
   "release": {

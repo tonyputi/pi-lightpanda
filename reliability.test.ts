@@ -382,7 +382,7 @@ await test("snapshots distinguish identical buttons and special IDs, refresh mar
 
 await test("shared-page tools run sequentially and invalid/stale inputs are marked as failed", async () => {
 	const pi = harness();
-	for (const name of ["navigate", "snapshot", "act", "eval"]) assert.equal(pi.tools.get(`lightpanda_${name}`)?.executionMode, "sequential");
+	for (const name of ["navigate", "snapshot", "act", "eval", "extract"]) assert.equal(pi.tools.get(`lightpanda_${name}`)?.executionMode, "sequential");
 	for (const [name, params] of [
 		["fetch", { url: "file:///etc/passwd" }], ["navigate", { url: "javascript:alert(1)" }],
 		["act", { action: "click", target: "e99" }], ["eval", { expression: "" }], ["run", { script: "untrusted.txt" }],

@@ -147,7 +147,7 @@ export PI_LIGHTPANDA_BIN="$HOME/tools/lightpanda"
 - Snapshot refs (`e1`, `e2`, …) map to unique, temporary DOM attributes, not
   ambiguous IDs/classes. Identical buttons remain distinct, and DOM reordering
   does not move a marker to another element. A new snapshot removes old markers.
-  Refs expire after navigation, actions (including failed ones), evaluation,
+  Refs expire after navigation, actions (including failed ones), `lightpanda_eval`,
   stop or restart; stale or duplicated targets fail safely. Password input values
   are omitted. CDP tools execute sequentially so they cannot race over the shared
   page/ref map; one persistent page per session keeps logins and state.
@@ -163,7 +163,7 @@ export PI_LIGHTPANDA_BIN="$HOME/tools/lightpanda"
 
 Tools (called by the agent): `lightpanda_fetch`, `lightpanda_navigate`,
 `lightpanda_snapshot`, `lightpanda_act` (click/fill/type/select/press/hover),
-`lightpanda_eval`, `lightpanda_run`, `lightpanda_status`.
+`lightpanda_extract`, `lightpanda_eval`, `lightpanda_run`, `lightpanda_status`.
 
 Command: `/lightpanda status | start | stop | setup | update` — server health,
 lifecycle, in-Pi binary install and confirmed updates (external servers are
@@ -172,12 +172,96 @@ never stopped, only ones this extension spawned).
 Suggested loop for the agent: `fetch` for reading → `navigate` → `snapshot`
 → `act` → re-`snapshot` → … → `run` to save a working flow as PandaScript.
 
+## Structured extraction
+
+Use `lightpanda_extract` when you need **named data fields**, not a page dump
+or repeated ad-hoc JavaScript. For example, Pi can extract a product name,
+price and availability, or collect documentation links as JSON.
+
+The agent supplies CSS selectors, usually after inspecting an unfamiliar page
+with `fetch` in HTML format. The tool does not guess selectors, infer facts,
+convert currencies/numbers, or make nested LLM calls.
+
+Example tool input:
+
+```json
+{
+  "url": "https://shop.example/product",
+  "waitForSelector": ".price",
+  "fields": [
+    { "name": "name", "selector": "h1", "required": true },
+    { "name": "price", "selector": ".price", "required": true },
+    { "name": "stock", "selector": ".availability" },
+    { "name": "docs", "selector": "a.docs", "attribute": "href", "many": true }
+  ]
+}
+```
+
+- **`url` is optional.** With it, the tool navigates the persistent CDP page,
+  invalidating snapshot refs. Without it, extraction reads the current page
+  without navigating or changing snapshot markers. A page must already be open.
+- **`waitForSelector` is optional.** It waits up to the configured operation
+  timeout before reading JS-populated content; otherwise extraction reads the
+  DOM available after page readiness.
+- **Fields return strings/nulls, not invented values.** Text whitespace is
+  normalized. Attributes are raw DOM attributes: an `href` may remain relative,
+  and an input's `value` attribute is not necessarily its current live value.
+  Prices such as `€ 19,90` remain strings.
+- **Ambiguity is explicit.** By default a selector must match exactly one
+  element. Use `many: true` for lists; `maxValues` defaults to 20 and is capped
+  at 50 per field. You can request 1–12 uniquely named fields.
+
+Every field includes `name`, `selector`, `status`, `matches`, `values` and
+`truncated` (plus the requested `attribute` and an explanatory message when
+relevant). A two-field request might return:
+
+```json
+{
+  "source": {
+    "url": "https://shop.example/product",
+    "title": "Example product",
+    "retrievedAt": "2026-10-15T12:00:00.000Z"
+  },
+  "fields": [
+    { "name": "price", "selector": ".price", "status": "ok", "matches": 1, "values": ["€ 19,90"], "truncated": false },
+    { "name": "stock", "selector": ".availability", "status": "missing", "matches": 0, "values": [], "truncated": false }
+  ],
+  "complete": false,
+  "truncated": false
+}
+```
+
+The source URL is the final URL after redirects; the title is limited to 200
+code units and the acquisition timestamp is UTC. Statuses distinguish `ok`,
+`missing`, `ambiguous`, `redacted` and `error`. A missing element gives `[]`;
+a missing attribute gives `null`; an observed empty string remains `""`.
+Password input `value` reads are redacted to `null`.
+
+Invalid/unsupported CSS and ambiguous scalar selectors mark the tool as failed.
+A `required: true` field also fails if missing, redacted or truncated. Failures
+at field level still return all available structured results. Optional missing
+fields are not a tool error, but `complete` is false. `complete` is true only
+when every requested field succeeded without truncation.
+
+Results are schema-validated and available both as JSON text and
+`structuredContent` (for programmatic callers/codemode). The byte limit applies
+to complete serialized JSON, **never a cut-off JSON document**. Values are
+limited to 2048 code units and the total output budget is
+`PI_LIGHTPANDA_MAX_BYTES` (capped at 64 KB for extraction). Partial values/lists
+set `truncated`; if metadata alone will not fit, request fewer/shorter fields
+or raise the configured limit. Schema validation checks structure, not the
+truth of a website's claims.
+
 ## Security notes
 
 - CDP grants full control of the connected browser. This extension only talks
   to loopback endpoints and never exposes the server beyond `127.0.0.1`.
 - `lightpanda_eval` and `lightpanda_run` execute JavaScript — treat target
   pages and script files as code. Only `run` scripts you trust.
+- Extraction output is untrusted page data, not instructions. It can contain
+  private content, URLs/query strings and attributes from your active session.
+  Password input redaction is not a general secrets/PII filter; do not publish
+  results from private pages without review.
 - Packages run with full system access — review third-party extension source
   before installing.
 
@@ -212,9 +296,11 @@ With Lightpanda installed, run the optional integration check:
 npm run test:smoke
 ```
 
-It serves a local fixture on an ephemeral loopback port, verifies real CDP
-snapshots/clicks and stale refs, and checks managed-server cleanup and external
-server preservation. It does not download/update binaries or use external sites.
+It serves local fixtures on ephemeral loopback ports, verifies real CDP
+snapshots/clicks and stale refs, structured extraction with JS-populated data,
+redirect provenance and required/missing fields, and managed-server cleanup and
+external-server preservation. It does not download/update binaries or use
+external sites.
 
 ## Contributing
 

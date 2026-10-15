@@ -27,16 +27,17 @@ npm run test:smoke   # real CDP checks against ephemeral loopback fixtures
 
 The smoke test does not install/update binaries or visit external sites.
 
-No build step: Pi loads the TypeScript extension directly (`index.ts` and
-`setup.ts`); tests use Node 22.18+ native type stripping. Keep the runtime
+No build step: Pi loads the TypeScript extension directly (`index.ts`,
+`setup.ts` and `extract.ts`); tests use Node 22.18+ native type stripping. Keep the runtime
 small — few files are the auditability feature.
 
 ## Pull requests
 
 - Small diffs. If a change needs a wall of prose to explain, split it.
 - Pure helpers get tests in `test.ts`. Lifecycle, setup/update, stream failures
-  and snapshot regressions belong in `reliability.test.ts`; real-browser checks
-  belong in the optional `smoke.ts` fixture.
+  and snapshot regressions belong in `reliability.test.ts`; extraction/schema
+  checks belong in `extraction.test.ts`. Real-browser checks belong in the
+  optional `smoke.ts` fixture.
 - Typecheck and `npm test` must pass; update the README if user-visible behavior
   changes. Run the optional smoke test when changing CDP interactions if possible.
 - The only runtime dependency is `puppeteer-core` (the CDP client; ships no
