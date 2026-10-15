@@ -9,7 +9,7 @@ import { findInstalledBinary, type WizardUI } from "./setup.ts";
 import type { ExtractionOutput } from "./extract.ts";
 
 interface ToolResult { isError?: boolean; content: Array<{ text?: string }>; structuredContent?: ExtractionOutput }
-interface Tool { name: string; execute(id: string, params: unknown): Promise<ToolResult> }
+interface Tool { name: string; execute(id: string, params: unknown, signal?: AbortSignal): Promise<ToolResult> }
 const ui: WizardUI = { confirm: async () => { throw new Error("smoke test must never prompt or download"); }, notify: () => {} };
 const ctx = { hasUI: true, ui };
 function harness() {
@@ -108,6 +108,29 @@ try {
 		assert.equal(required.isError, true);
 		assert.equal(required.structuredContent?.fields[0].status, "missing");
 		console.log("ok real extraction: JS content, redirect provenance, raw attributes, missing/required fields, password redaction");
+		const controller = new AbortController();
+		const cancelledAt = Date.now();
+		const cancelTimer = setTimeout(() => controller.abort(), 100);
+		try {
+			const cancelled = await managed.tools.get("lightpanda_extract")!.execute("cancel", {
+				fields: [{ name: "price", selector: ".price" }], waitForSelector: ".never-present",
+			}, controller.signal);
+			assert.equal(cancelled.isError, true);
+			assert.match(cancelled.content[0].text!, /abort/i);
+			assert.ok(Date.now() - cancelledAt < 2500, "cancellation interrupts the selector wait instead of waiting for the 10s timeout");
+		} finally { clearTimeout(cancelTimer); }
+		console.log("ok real selector cancellation without losing the browser session");
+		await managed.call("eval", { expression: "(() => { for (let i=0; i<20; i++) { const el=document.createElement('p'); el.className='bulk'; el.textContent='x'.repeat(2048); document.body.appendChild(el); } return 'created'; })()" });
+		for (const priceFirst of [false, true]) {
+			const fields = [{ name: "bulk", selector: ".bulk", many: true }, { name: "price", selector: ".price", required: true }];
+			if (priceFirst) fields.reverse();
+			const output = JSON.parse(await managed.call("extract", { fields })) as ExtractionOutput;
+			const price = output.fields.find((field) => field.name === "price")!;
+			assert.deepEqual(price.values, ["€ 19,90"]);
+			assert.equal(price.truncated, false);
+			assert.equal(output.truncated, true, "only the optional list is truncated");
+		}
+		console.log("ok real budget priority: required price survives long lists in either field order");
 		const snapshot = await managed.call("snapshot");
 		assert.ok(!snapshot.includes("fixture-password-not-for-output"));
 		const refs = [...snapshot.matchAll(/^\[(e\d+)\] button/gm)].map((match) => match[1]);

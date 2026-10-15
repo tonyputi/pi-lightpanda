@@ -375,12 +375,15 @@ async function ensurePage(config: LightpandaConfig, signal?: AbortSignal): Promi
 }
 
 /** Best-effort ready wait: domcontentloaded already happened in goto. */
-async function waitForReady(p: Page, timeoutMs: number): Promise<void> {
+async function waitForReady(p: Page, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
 	try {
-		await p.waitForFunction("document.readyState === 'complete'", { timeout: Math.min(timeoutMs, 10_000) });
+		await p.waitForFunction("document.readyState === 'complete'", { timeout: Math.min(timeoutMs, 10_000), signal });
 	} catch {
-		// return what we have; never hang the agent on restless pages
+		// Readiness timeout is best-effort, but cancellation must never be swallowed.
+		signal?.throwIfAborted();
 	}
+	signal?.throwIfAborted();
 }
 
 // --- fetch via CLI (no server needed) -----------------------------------------
@@ -574,8 +577,8 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 			const held = await ensurePage(cfg, signal);
 			if ("error" in held) return errorResult(held.error);
 			try {
-				await held.page.goto(p.url, { waitUntil: "domcontentloaded", timeout: cfg.timeoutMs });
-				await waitForReady(held.page, 10_000);
+				await held.page.goto(p.url, { waitUntil: "domcontentloaded", timeout: cfg.timeoutMs, signal });
+				await waitForReady(held.page, 10_000, signal);
 				const title = await held.page.title().catch(() => "");
 				refMap = new Map();
 				return textResult(`ok: ${held.page.url()}${title ? ` — "${title.slice(0, 200)}"` : ""}`);
@@ -628,6 +631,7 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 			const held = await ensurePage(cfg, signal);
 			if ("error" in held) return errorResult(held.error);
 			try {
+				signal.throwIfAborted();
 				const pg = held.page;
 				if (isRef && (await pg.$$eval(selector, (elements) => elements.length)) !== 1) {
 					return errorResult("reference no longer identifies exactly one element — take a fresh snapshot");
@@ -653,7 +657,7 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 					const key = (p.value ?? "Enter") as Parameters<Page["keyboard"]["press"]>[0];
 					await pg.keyboard.press(key);
 				} else return errorResult(`unknown action "${p.action}"`);
-				await waitForReady(pg, 5000);
+				await waitForReady(pg, 5000, signal);
 				refMap = new Map(); // stale — force a fresh snapshot next
 				return textResult(`ok: ${p.action} ${p.target} — re-run lightpanda_snapshot to see the result`);
 			} catch (err) {
@@ -680,12 +684,14 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 			const held = await ensurePage(cfg, signal);
 			if ("error" in held) throw new Error(held.error);
 			try {
+				signal.throwIfAborted();
 				if (params.url) {
-					await held.page.goto(params.url, { waitUntil: "domcontentloaded", timeout: cfg.timeoutMs });
-					await waitForReady(held.page, 10_000);
+					await held.page.goto(params.url, { waitUntil: "domcontentloaded", timeout: cfg.timeoutMs, signal });
+					await waitForReady(held.page, 10_000, signal);
 				}
 				if (!isHttpUrl(held.page.url())) throw new Error("extraction source must be http(s)");
-				if (params.waitForSelector) await held.page.waitForSelector(params.waitForSelector, { timeout: cfg.timeoutMs });
+				if (params.waitForSelector) await held.page.waitForSelector(params.waitForSelector, { timeout: cfg.timeoutMs, signal });
+				signal.throwIfAborted();
 				const budget = Math.min(cfg.maxBytes, 65_536);
 				const raw = await held.page.evaluate(collectExtraction, params.fields, params.maxValues ?? 20, budget);
 				signal.throwIfAborted();

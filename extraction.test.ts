@@ -133,10 +133,9 @@ await test("DOM transfer limits mark truncated values and preserve complete fiel
 	nodes.set(".long", [new ElementFixture("x".repeat(3000))]);
 	const input = params([{ name: "long", selector: ".long" }, { name: "price", selector: ".price" }]);
 	const limited = collectExtraction(input.fields, 20, 10);
-	assert.equal(limited.fields[0].values[0], "x".repeat(10));
-	assert.equal(limited.fields[0].truncated, true);
-	assert.deepEqual(limited.fields[1].values, [""]);
-	assert.equal(limited.fields[1].truncated, true);
+	assert.ok(limited.fields.every((field) => field.values[0]!.length > 0), "same-priority fields share the budget");
+	assert.equal(limited.fields.reduce((sum, field) => sum + field.values[0]!.length, 0), 10);
+	assert.ok(limited.fields.every((field) => field.truncated));
 	const perValue = collectExtraction(input.fields, 20, 10000);
 	assert.equal(perValue.fields[0].values[0]?.length, 2048);
 	assert.equal(perValue.fields[0].truncated, true);
@@ -178,6 +177,74 @@ await test("multi-field byte budgets retain provenance, missing fields and valid
 		assert.equal(extractionFailed(output, input), true);
 		assert.ok(Check(ExtractionOutputSchema, JSON.parse(JSON.stringify(output))));
 	}
+}));
+
+await test("required scalars survive optional lists regardless of field order in both budgets", async () => withDom((nodes) => {
+	nodes.set(".bulk", Array.from({ length: 20 }, () => new ElementFixture("x".repeat(2048))));
+	for (const charBudget of [4096, 60000]) {
+		const outputs: ExtractionOutput[] = [];
+		for (const priceFirst of [false, true]) {
+			const fields: ExtractionParams["fields"] = [
+				{ name: "bulk", selector: ".bulk", many: true },
+				{ name: "price", selector: ".price", required: true },
+			];
+			if (priceFirst) fields.reverse();
+			const input = params(fields);
+			const raw = collectExtraction(fields, 20, charBudget);
+			assert.deepEqual(raw.fields.find((field) => field.name === "price")!.values, ["€ 19,90"]);
+			const output = prepareExtraction(raw, input, 4096, "2026-10-15T12:00:00.000Z");
+			const price = output.fields.find((field) => field.name === "price")!;
+			assert.deepEqual(price.values, ["€ 19,90"]);
+			assert.equal(price.truncated, false);
+			assert.equal(extractionFailed(output, input), false);
+			assert.equal(output.truncated, true, "only optional list data needs truncation");
+			assert.deepEqual(output.fields.map((field) => field.name), fields.map((field) => field.name));
+			assert.ok(Buffer.byteLength(JSON.stringify(output)) <= 4096);
+			outputs.push(output);
+		}
+		assert.deepEqual(outputs[0].fields, outputs[1].fields.toReversed(), "request order does not change field contents");
+	}
+}));
+
+await test("same-priority fields share character and byte quotas independently of request order", async () => withDom((nodes) => {
+	nodes.set(".alpha", [new ElementFixture("a".repeat(2048))]);
+	nodes.set(".beta", [new ElementFixture("b".repeat(2048))]);
+	for (const required of [false, true]) {
+		for (const reversed of [false, true]) {
+			const fields: ExtractionParams["fields"] = [
+				{ name: "alpha", selector: ".alpha", required },
+				{ name: "beta", selector: ".beta", required },
+			];
+			if (reversed) fields.reverse();
+			const limited = collectExtraction(fields, 20, 11);
+			assert.equal(limited.fields.find((field) => field.name === "alpha")!.values[0]!.length, 5);
+			assert.equal(limited.fields.find((field) => field.name === "beta")!.values[0]!.length, 6);
+			const output = prepareExtraction(collectExtraction(fields, 20, 10000), params(fields), 1200);
+			const lengths = output.fields.map((field) => field.values[0]!.length);
+			assert.ok(lengths.every((length) => length > 0));
+			assert.ok(Math.abs(lengths[0] - lengths[1]) <= 1);
+			assert.ok(Buffer.byteLength(JSON.stringify(output)) <= 1200);
+		}
+	}
+}));
+
+await test("list values share a limited character quota instead of starving later matches", async () => withDom((nodes) => {
+	nodes.set(".bulk", Array.from({ length: 3 }, () => new ElementFixture("x".repeat(100))));
+	const result = collectExtraction([{ name: "list", selector: ".bulk", many: true }], 20, 11);
+	assert.deepEqual(result.fields[0].values.map((value) => value!.length), [3, 4, 4]);
+	assert.equal(result.fields[0].matches, 3);
+	assert.equal(result.fields[0].truncated, true);
+}));
+
+await test("list values also share the serialized byte quota", async () => withDom((nodes) => {
+	nodes.set(".bulk", Array.from({ length: 3 }, () => new ElementFixture("x".repeat(1000))));
+	const input = params([{ name: "list", selector: ".bulk", many: true }]);
+	const output = prepareExtraction(collectExtraction(input.fields, 20, 10000), input, 600);
+	const lengths = output.fields[0].values.map((value) => value!.length);
+	assert.ok(lengths.every((length) => length > 0));
+	assert.ok(Math.max(...lengths) - Math.min(...lengths) <= 1);
+	assert.equal(output.truncated, true);
+	assert.ok(Buffer.byteLength(JSON.stringify(output)) <= 600);
 }));
 
 await test("untrusted browser output must satisfy schema and correspond to the requested fields", async () => withDom(() => {
@@ -251,3 +318,74 @@ await test("registered tool returns matching JSON/structuredContent, supports cu
 		globalThis.fetch = savedFetch;
 	}
 }));
+
+function within<T>(promise: Promise<T>, milliseconds = 1000): Promise<T> {
+	let timer: ReturnType<typeof setTimeout>;
+	const timeout = new Promise<never>((_resolve, reject) => {
+		timer = setTimeout(() => reject(new Error("operation did not respond to cancellation")), milliseconds);
+	});
+	return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+for (const stage of ["navigation", "readiness", "selector", "ignored-selector"] as const) {
+	await test(`cancelling ${stage} prevents subsequent DOM extraction`, async () => withDom(async () => {
+		const savedConnect = puppeteer.connect;
+		const savedFetch = globalThis.fetch;
+		type ToolResult = { isError?: boolean; content: Array<{ text?: string }> };
+		type Tool = { name: string; execute(id: string, params: unknown, signal?: AbortSignal): Promise<ToolResult> };
+		const tools = new Map<string, Tool>();
+		const controller = new AbortController();
+		let shutdown: (() => Promise<void>) | undefined;
+		let finishWait: (() => void) | undefined;
+		let enteredWait!: () => void;
+		const entered = new Promise<void>((resolve) => { enteredWait = resolve; });
+		let capturedSignal: AbortSignal | undefined;
+		let reads = 0;
+		let pending: Promise<ToolResult> | undefined;
+		const waiting = (options: { signal?: AbortSignal }): Promise<void> => {
+			capturedSignal = options.signal;
+			return new Promise<void>((resolve, reject) => {
+				finishWait = resolve;
+				if (stage !== "ignored-selector") options.signal?.addEventListener("abort", () => reject(options.signal!.reason), { once: true });
+				enteredWait();
+			});
+		};
+		const page = {
+			isClosed: () => false, setDefaultTimeout: () => {}, url: () => "https://fixture.test/",
+			goto: async (_url: string, options: { signal?: AbortSignal }) => { if (stage === "navigation") await waiting(options); },
+			waitForFunction: async (_expression: string, options: { signal?: AbortSignal }) => { if (stage === "readiness") await waiting(options); },
+			waitForSelector: async (_selector: string, options: { signal?: AbortSignal }) => waiting(options),
+			evaluate: async (fn: (...args: never[]) => unknown, ...args: unknown[]) => { reads++; return fn(...args as never[]); },
+		};
+		puppeteer.connect = (async () => ({
+			createBrowserContext: async () => ({ newPage: async () => page, close: async () => {} }),
+			disconnect: async () => {},
+		})) as unknown as typeof puppeteer.connect;
+		globalThis.fetch = async () => Response.json({ Browser: "external fixture" });
+		try {
+			extension({
+				registerTool: (tool: Tool) => tools.set(tool.name, tool), registerCommand: () => {},
+				on: (name: string, handler: () => Promise<void>) => { if (name === "session_shutdown") shutdown = handler; },
+			} as unknown as ExtensionAPI);
+			pending = tools.get("lightpanda_extract")!.execute("cancel", {
+				url: "https://fixture.test/", fields: [{ name: "name", selector: "h1" }], waitForSelector: "h1",
+			}, controller.signal);
+			await within(entered);
+			assert.ok(capturedSignal, "the operation signal reaches Puppeteer");
+			controller.abort();
+			assert.equal(capturedSignal.aborted, true);
+			if (stage === "ignored-selector") finishWait!();
+			const result = await within(pending);
+			assert.equal(result.isError, true);
+			assert.match(result.content[0].text!, /abort/i);
+			assert.equal(reads, 0, "no DOM evaluation is started after cancellation");
+		} finally {
+			controller.abort();
+			finishWait?.();
+			await pending?.catch(() => {});
+			await shutdown?.();
+			puppeteer.connect = savedConnect;
+			globalThis.fetch = savedFetch;
+		}
+	}));
+}

@@ -202,7 +202,8 @@ Example tool input:
   without navigating or changing snapshot markers. A page must already be open.
 - **`waitForSelector` is optional.** It waits up to the configured operation
   timeout before reading JS-populated content; otherwise extraction reads the
-  DOM available after page readiness.
+  DOM available after page readiness. Cancellation reaches navigation, readiness
+  and selector waits; an aborted request does not start a subsequent DOM read.
 - **Fields return strings/nulls, not invented values.** Text whitespace is
   normalized. Attributes are raw DOM attributes: an `href` may remain relative,
   and an input's `value` attribute is not necessarily its current live value.
@@ -248,8 +249,12 @@ Results are schema-validated and available both as JSON text and
 to complete serialized JSON, **never a cut-off JSON document**. Values are
 limited to 2048 code units and the total output budget is
 `PI_LIGHTPANDA_MAX_BYTES` (capped at 64 KB for extraction). Partial values/lists
-set `truncated`; if metadata alone will not fit, request fewer/shorter fields
-or raise the configured limit. Schema validation checks structure, not the
+set `truncated`. Required fields receive value space before optional fields;
+within each priority tier, fields and list values share the available budget.
+Field order does not determine priority, and results keep the requested order.
+Required fields still fail explicitly if their own data cannot fit the limits.
+If metadata alone will not fit, request fewer/shorter fields or raise the
+configured limit. Schema validation checks structure, not the
 truth of a website's claims.
 
 ## Security notes

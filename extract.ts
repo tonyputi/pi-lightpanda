@@ -69,7 +69,6 @@ export function collectExtraction(fields: ExtractionParams["fields"], maxValues:
 		if (end > 0 && end < value.length && /[\uD800-\uDBFF]/.test(value[end - 1]) && /[\uDC00-\uDFFF]/.test(value[end])) end--;
 		return value.slice(0, end);
 	}
-	let remaining = Math.max(0, charBudget);
 	const results: ExtractedField[] = [];
 	for (const spec of fields) {
 		const result: ExtractedField = {
@@ -116,10 +115,34 @@ export function collectExtraction(fields: ExtractionParams["fields"], maxValues:
 			}
 			// Preserve raw attributes, but normalize whitespace in human-facing text.
 			const normalized = spec.attribute ? raw : raw.replace(/\s+/g, " ").trim();
-			const value = prefix(normalized, Math.min(2048, remaining));
+			const value = prefix(normalized, 2048);
 			if (value.length < normalized.length) result.truncated = true;
-			remaining -= value.length;
 			result.values.push(value);
+		}
+	}
+	// Collect bounded values before allocating transfer space: an early optional
+	// list must not starve a required scalar later in the request. Keep output order.
+	let remaining = Math.max(0, charBudget);
+	for (const required of [true, false]) {
+		const group = results.map((field, index) => ({
+			field, index, cost: field.values.reduce<number>((sum, value) => sum + (value?.length ?? 0), 0),
+		})).filter((entry) => Boolean(fields[entry.index].required) === required && entry.cost > 0)
+			.sort((a, b) => a.cost - b.cost || (a.field.name < b.field.name ? -1 : a.field.name > b.field.name ? 1 : 0));
+		for (let index = 0; index < group.length; index++) {
+			const { field, cost } = group[index];
+			let quota = Math.min(cost, Math.floor(remaining / (group.length - index)));
+			const values = field.values.map((value, index) => ({ value, index }))
+				.filter((entry): entry is { value: string; index: number } => typeof entry.value === "string" && entry.value.length > 0)
+				.sort((a, b) => a.value.length - b.value.length || a.index - b.index);
+			for (let item = 0; item < values.length; item++) {
+				const original = values[item];
+				const share = Math.min(original.value.length, Math.floor(quota / (values.length - item)));
+				const value = prefix(original.value, share);
+				field.values[original.index] = value;
+				if (value !== original.value) field.truncated = true;
+				quota -= value.length;
+				remaining -= value.length;
+			}
 		}
 	}
 	return { url: location.href, title: prefix(document.title.replace(/\s+/g, " ").trim(), 200), fields: results };
@@ -131,7 +154,7 @@ function summary(output: ExtractionOutput): void {
 }
 
 /** Preserve valid JSON/provenance/field statuses when applying the UTF-8 output budget. */
-export function fitExtraction(output: ExtractionOutput, maxBytes: number): ExtractionOutput {
+export function fitExtraction(output: ExtractionOutput, maxBytes: number, requiredNames: ReadonlySet<string> = new Set()): ExtractionOutput {
 	const size = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8");
 	if (size(output) <= maxBytes) return output;
 	const bounded = structuredClone(output);
@@ -143,26 +166,41 @@ export function fitExtraction(output: ExtractionOutput, maxBytes: number): Extra
 	// Replacing true with false costs one extra byte per flag. Reserve that cost.
 	let remaining = maxBytes - size(bounded) - bounded.fields.length - 2;
 	if (remaining < 0) throw new Error("extraction metadata exceeds the output budget; request fewer/shorter fields or increase PI_LIGHTPANDA_MAX_BYTES");
-	for (let index = 0; index < bounded.fields.length; index++) {
-		const field = bounded.fields[index];
-		const original = output.fields[index];
-		field.truncated = original.truncated;
-		for (let item = 0; item < original.values.length; item++) {
-			const raw = original.values[item];
-			if (raw === null) continue;
-			let low = 0;
-			let high = raw.length;
-			while (low < high) {
-				const middle = Math.ceil((low + high) / 2);
-				if (size(raw.slice(0, middle)) - 2 <= remaining) low = middle;
-				else high = middle - 1;
+	const entries = output.fields.map((original, index) => {
+		bounded.fields[index].truncated = original.truncated;
+		const values = original.values.map((value, index) => ({ value, index, cost: typeof value === "string" ? size(value) - 2 : 0 }))
+			.filter((entry): entry is { value: string; index: number; cost: number } => typeof entry.value === "string" && entry.cost > 0)
+			.sort((a, b) => a.cost - b.cost || a.index - b.index);
+		return { original, index, values, cost: values.reduce((sum, value) => sum + value.cost, 0) };
+	});
+	// Required fields first, max-min sharing within each tier (including list
+	// values). Stable names break ties, not the caller's field order.
+	for (const required of [true, false]) {
+		const group = entries.filter((entry) => requiredNames.has(entry.original.name) === required && entry.cost > 0)
+			.sort((a, b) => a.cost - b.cost || (a.original.name < b.original.name ? -1 : a.original.name > b.original.name ? 1 : 0));
+		for (let index = 0; index < group.length; index++) {
+			const entry = group[index];
+			const field = bounded.fields[entry.index];
+			let quota = Math.min(entry.cost, Math.floor(remaining / (group.length - index)));
+			for (let item = 0; item < entry.values.length; item++) {
+				const { value: raw, index: valueIndex, cost } = entry.values[item];
+				const share = Math.min(cost, Math.floor(quota / (entry.values.length - item)));
+				let low = 0;
+				let high = raw.length;
+				while (low < high) {
+					const middle = Math.ceil((low + high) / 2);
+					if (size(raw.slice(0, middle)) - 2 <= share) low = middle;
+					else high = middle - 1;
+				}
+				// A prefix ending halfway through an emoji would invent a lone surrogate.
+				if (low > 0 && low < raw.length && /[\uD800-\uDBFF]/.test(raw[low - 1]) && /[\uDC00-\uDFFF]/.test(raw[low])) low--;
+				const value = raw.slice(0, low);
+				const used = size(value) - 2;
+				quota -= used;
+				remaining -= used;
+				field.values[valueIndex] = value;
+				if (value !== raw) field.truncated = true;
 			}
-			// A prefix ending halfway through an emoji would invent a lone surrogate.
-			if (low > 0 && low < raw.length && /[\uD800-\uDBFF]/.test(raw[low - 1]) && /[\uDC00-\uDFFF]/.test(raw[low])) low--;
-			const value = raw.slice(0, low);
-			remaining -= size(value) - 2;
-			field.values[item] = value;
-			if (value !== raw) field.truncated = true;
 		}
 	}
 	summary(bounded);
@@ -181,7 +219,7 @@ export function prepareExtraction(raw: unknown, params: ExtractionParams, maxByt
 		fields: structuredClone(raw.fields), complete: false, truncated: false,
 	};
 	summary(output);
-	const bounded = fitExtraction(output, maxBytes);
+	const bounded = fitExtraction(output, maxBytes, new Set(params.fields.filter((field) => field.required).map((field) => field.name)));
 	if (!Check(ExtractionOutputSchema, bounded)) throw new Error("extraction output failed schema validation");
 	return bounded;
 }
