@@ -1,3 +1,10 @@
+## [0.2.1](https://github.com/tonyputi/pi-lightpanda/compare/v0.2.0...v0.2.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* harden browser lifecycle and binary installation ([cbd640c](https://github.com/tonyputi/pi-lightpanda/commit/cbd640c860235ee3ae03dd25e2448d9f5b0822b1))
+
 # [0.2.0](https://github.com/tonyputi/pi-lightpanda/compare/v0.1.0...v0.2.0) (2026-10-14)
 
 
