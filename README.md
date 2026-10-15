@@ -216,6 +216,14 @@ It serves a local fixture on an ephemeral loopback port, verifies real CDP
 snapshots/clicks and stale refs, and checks managed-server cleanup and external
 server preservation. It does not download/update binaries or use external sites.
 
+## Contributing
+
+See the [contribution guide](.github/CONTRIBUTING.md) and
+[Code of Conduct](.github/CODE_OF_CONDUCT.md). Use the
+[issue forms](https://github.com/tonyputi/pi-lightpanda/issues/new/choose)
+for bugs and feature requests. Do not include secrets or private browsing data;
+report security issues privately as described in the contribution guide.
+
 ## License
 
 MIT

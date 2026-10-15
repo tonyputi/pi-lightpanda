@@ -1,0 +1,52 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem.
+
+        **Never paste secrets or private browsing data**: no passwords, tokens, cookies, authorization headers, or private page contents.
+        `/lightpanda status` can include local paths, the current page URL and its query string: redact sensitive details before sharing.
+        For security-sensitive reports, contact the maintainer privately at <filippo@sallemi.it> instead of using this public form.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the problem, including any error message you saw.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Name the failing tool or command. A public test URL or minimal HTML fixture helps; do not include private pages or authenticated sessions.
+      placeholder: |
+        1. Run /lightpanda setup or start with an installed binary.
+        2. Call lightpanda_fetch / navigate / snapshot / act / eval / run, or a /lightpanda subcommand.
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Pi version, pi-lightpanda version, Lightpanda version (shown by /lightpanda status), OS/architecture, and installation source (npm, git, or local checkout).
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output
+      description: Redacted /lightpanda status output, failing tool results, or terminal errors. Remove secrets, private URLs/query strings, and sensitive local paths.
+      render: shell
+    validations:
+      required: false

@@ -1,0 +1,31 @@
+name: Feature request
+description: Suggest an idea for this extension
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This extension provides lightweight JavaScript/DOM browsing and automation without downloading Chromium.
+        Describe a concrete task the feature would improve. New runtime dependencies, browser engines, or changes to credential/cookie/session handling need extra justification.
+        Do not include passwords, tokens, cookies, or private page contents in examples.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: The problem, not the solution restated. Include an example task if possible.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would you like to happen?
+      description: Describe the expected behavior and how you would verify that it helps.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What alternatives have you considered?
+      description: Existing tools, manual workarounds, or configuration that already gets you part of the way. Explain why fetch, eval, a PandaScript, or a Chromium-backed tool is not sufficient.
+    validations:
+      required: false
