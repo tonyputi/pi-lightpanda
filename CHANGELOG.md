@@ -1,3 +1,15 @@
+# [0.3.0](https://github.com/tonyputi/pi-lightpanda/compare/v0.2.1...v0.3.0) (2026-10-15)
+
+
+### Bug Fixes
+
+* honor extraction cancellation and required field budgets ([5415565](https://github.com/tonyputi/pi-lightpanda/commit/54155652e26bb5d24f20a607a501f49c211073cc))
+
+
+### Features
+
+* extract structured DOM fields with provenance ([20139e4](https://github.com/tonyputi/pi-lightpanda/commit/20139e4deb8c4f32920eac164387a32da8bc1fe4))
+
 ## [0.2.1](https://github.com/tonyputi/pi-lightpanda/compare/v0.2.0...v0.2.1) (2026-10-15)
 
 
