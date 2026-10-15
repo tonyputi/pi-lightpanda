@@ -1,1 +1,1 @@
-{"compilerOptions": {"allowImportingTsExtensions": true, "module": "nodenext", "moduleResolution": "nodenext", "noEmit": true, "skipLibCheck": true, "strict": true, "target": "es2023", "types": ["node"]}, "include": ["index.ts", "setup.ts", "test.ts"]}
+{"compilerOptions": {"allowImportingTsExtensions": true, "module": "nodenext", "moduleResolution": "nodenext", "noEmit": true, "erasableSyntaxOnly": true, "skipLibCheck": true, "strict": true, "target": "es2023", "types": ["node"]}, "include": ["*.ts"]}
