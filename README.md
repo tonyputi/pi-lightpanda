@@ -1,8 +1,8 @@
 # pi-lightpanda
 
 A [Pi](https://pi.dev) extension that gives the agent a **lightweight headless
-browser** via [Lightpanda](https://lightpanda.io) — ~16x less memory and ~9x
-faster than Chrome headless, CDP-compatible.
+browser** via [Lightpanda](https://lightpanda.io), with a CDP-compatible
+interface and no Chromium download.
 
 Keywords: pi browser extension, lightpanda headless browser, AI agent web
 automation, CDP browser without Chromium, lightweight scraping for coding
@@ -11,10 +11,10 @@ agents.
 ## The problem
 
 Coding agents need a browser for fetching pages, scraping, testing flows, and
-verifying web output — but every existing Pi browser extension launches
-**Chromium** (~1 GB+ per instance, seconds to start). For an agent that opens
-dozens of pages per task, that is slow, expensive, and wasteful — especially
-in CI or on small machines.
+verifying web output. **Chromium**-based automation brings a full rendering
+engine even when the task only needs selected page data. For agents that open
+many pages, runtime resources and the volume of data returned to the model
+are two separate costs worth controlling.
 
 Most of that weight is code the agent never uses: rendering, GPU, codecs,
 font caches, UI. A headless agent needs JS execution + DOM + CDP, nothing
@@ -24,12 +24,16 @@ else.
 
 `pi-lightpanda` drives a local **Lightpanda** binary instead of Chromium:
 
-| | Lightpanda | Headless Chrome |
-|---|---|---|
-| Memory (100 pages) | ~123 MB | ~2 GB |
-| Time (100 pages) | ~5 s | ~46 s |
-| Startup | instant | seconds |
-| Engine | from-scratch (Zig) | Blink + V8 + Skia + … |
+**Runtime efficiency:** [Lightpanda's upstream crawler benchmark](https://github.com/lightpanda-io/browser#performance)
+reports approximately 16x lower peak memory and 9x faster execution than
+headless Chrome for its particular workload and environment. These are upstream
+browser results, **not measurements of this Pi extension or universal guarantees**.
+
+**Context efficiency:** Markdown dumps, selected CSS fields, byte budgets and
+replayable scripts can reduce the page data returned to the agent. A faster
+browser does not inherently use fewer model tokens. Byte counts below measure
+UTF-8 output, not tokens; token comparisons require a named tokenizer/model and
+a reproducible measurement.
 
 The extension manages the whole lifecycle: one-shot `fetch` for reading pages
 (no server needed), a persistent `serve` + `puppeteer-core` client for multi-step
@@ -172,6 +176,34 @@ never stopped, only ones this extension spawned).
 Suggested loop for the agent: `fetch` for reading → `navigate` → `snapshot`
 → `act` → re-`snapshot` → … → `run` to save a working flow as PandaScript.
 
+## Per-call output budgets
+
+`lightpanda_fetch` and `lightpanda_extract` accept an optional integer `maxBytes`
+from **256 to 65,536 bytes**. Request a smaller budget when only a concise result
+is needed, for example:
+
+```json
+{ "url": "https://example.com", "format": "markdown", "maxBytes": 4096 }
+```
+
+The effective budget is the smaller of `maxBytes` and the configured
+`PI_LIGHTPANDA_MAX_BYTES` ceiling. A call cannot increase that ceiling, even
+when the configured ceiling is below 256 bytes. Omitting `maxBytes` preserves
+existing behaviour (including extraction's existing 64 KB cap).
+
+Fetch passes the effective budget to Lightpanda's `--dump-max-bytes`; with an
+explicit budget the returned text, including any truncation marker, also fits
+that budget. Extraction applies the budget during DOM collection and to the
+final serialized JSON, preserving required-field priority. Small budgets may
+not fit even the extraction metadata: the tool fails explicitly rather than
+returning broken JSON. Increase the per-call budget within the ceiling, request
+fewer/shorter fields, or change the global configuration if needed. Error
+messages are not page-data payloads and are not fitted to this budget.
+
+For a reproducible same-page comparison of default Markdown, 4 KB Markdown
+and three named fields, see [output-byte evidence](docs/output-budget-evidence.md).
+This measures output/context bytes only, not browser performance or token usage.
+
 ## Structured extraction
 
 Use `lightpanda_extract` when you need **named data fields**, not a page dump
@@ -188,6 +220,7 @@ Example tool input:
 {
   "url": "https://shop.example/product",
   "waitForSelector": ".price",
+  "maxBytes": 4096,
   "fields": [
     { "name": "name", "selector": "h1", "required": true },
     { "name": "price", "selector": ".price", "required": true },
@@ -248,7 +281,8 @@ Results are schema-validated and available both as JSON text and
 `structuredContent` (for programmatic callers/codemode). The byte limit applies
 to complete serialized JSON, **never a cut-off JSON document**. Values are
 limited to 2048 code units and the total output budget is
-`PI_LIGHTPANDA_MAX_BYTES` (capped at 64 KB for extraction). Partial values/lists
+the smaller of per-call `maxBytes` (if supplied) and `PI_LIGHTPANDA_MAX_BYTES`
+(capped at 64 KB for extraction). Partial values/lists
 set `truncated`. Required fields receive value space before optional fields;
 within each priority tier, fields and list values share the available budget.
 Field order does not determine priority, and results keep the requested order.
@@ -304,8 +338,9 @@ npm run test:smoke
 It serves local fixtures on ephemeral loopback ports, verifies real CDP
 snapshots/clicks and stale refs, structured extraction with JS-populated data,
 redirect provenance and required/missing fields, and managed-server cleanup and
-external-server preservation. It does not download/update binaries or use
-external sites.
+external-server preservation. It also checks per-call budgets, required-field
+survival at 900 bytes and prints same-page UTF-8 byte measurements. It does not
+download/update binaries or use external sites.
 
 ## Contributing
 

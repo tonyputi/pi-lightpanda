@@ -6,7 +6,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import puppeteer from "puppeteer-core";
 import extension from "./index.ts";
 import {
-	collectExtraction, extractionFailed, ExtractionOutputSchema, prepareExtraction,
+	collectExtraction, effectiveMaxBytes, extractionFailed, ExtractionOutputSchema, prepareExtraction,
 	validateExtractionParams, type ExtractionParams, type ExtractionOutput,
 } from "./extract.ts";
 
@@ -51,6 +51,18 @@ const params = (fields: ExtractionParams["fields"]): ExtractionParams => ({ fiel
 const extract = (input: ExtractionParams, budget = 12288) => prepareExtraction(
 	collectExtraction(input.fields, input.maxValues ?? 20, budget), input, budget, "2026-10-15T12:00:00.000Z",
 );
+
+await test("per-call budgets preserve the ceiling and validate the bounded integer range", () => {
+	assert.equal(effectiveMaxBytes(12288), 12288);
+	assert.equal(effectiveMaxBytes(12288, 4096), 4096);
+	assert.equal(effectiveMaxBytes(12288, 65536), 12288);
+	assert.equal(effectiveMaxBytes(128, 256), 128);
+	assert.equal(effectiveMaxBytes(100000), 100000, "omitted budgets do not impose a new global cap");
+	for (const maxBytes of [256, 4096, 65536]) validateExtractionParams({ fields: [{ name: "x", selector: "h1" }], maxBytes });
+	for (const maxBytes of [255, 65537, 1.5, NaN, Infinity, "4096", null]) {
+		assert.throws(() => validateExtractionParams({ fields: [{ name: "x", selector: "h1" }], maxBytes }), /maxBytes/);
+	}
+});
 
 await test("parameter validation rejects malformed fields, unsafe URLs, duplicates and unbounded lists", () => {
 	validateExtractionParams({ fields: [{ name: "price", selector: ".price" }] });
@@ -264,7 +276,7 @@ await test("the DOM collector serializes without closures and only reads the pag
 	assert.equal(serialized([{ name: "name", selector: "h1" }], 20, 1000).fields[0].values[0], "Product Alpha");
 }));
 
-await test("registered tool returns matching JSON/structuredContent, supports current page and keeps partial failure data", async () => withDom(async () => {
+await test("registered tool returns matching JSON/structuredContent, supports current page and keeps partial failure data", async () => withDom(async (nodes) => {
 	const savedConnect = puppeteer.connect;
 	const savedFetch = globalThis.fetch;
 	type RegisteredTool = {
@@ -275,13 +287,19 @@ await test("registered tool returns matching JSON/structuredContent, supports cu
 	let shutdown: (() => Promise<void>) | undefined;
 	let navigations = 0;
 	let waitedFor = "";
+	let collectionBudget = 0;
+	const savedCeiling = process.env.PI_LIGHTPANDA_MAX_BYTES;
+	process.env.PI_LIGHTPANDA_MAX_BYTES = "1800";
 	let currentUrl = "about:blank";
 	const page = {
 		isClosed: () => false, setDefaultTimeout: () => {},
 		goto: async () => { navigations++; currentUrl = "https://fixture.test/final?lang=it"; },
 		url: () => currentUrl, waitForFunction: async () => {},
 		waitForSelector: async (selector: string) => { waitedFor = selector; },
-		evaluate: async (fn: (...args: never[]) => unknown, ...args: unknown[]) => fn(...args as never[]),
+		evaluate: async (fn: (...args: never[]) => unknown, ...args: unknown[]) => {
+			collectionBudget = args[2] as number;
+			return fn(...args as never[]);
+		},
 	};
 	puppeteer.connect = (async () => ({
 		createBrowserContext: async () => ({ newPage: async () => page, close: async () => {} }),
@@ -312,7 +330,29 @@ await test("registered tool returns matching JSON/structuredContent, supports cu
 		assert.equal(missing.isError, true);
 		assert.equal(missing.structuredContent?.fields[0].status, "missing");
 		assert.ok(Check(ExtractionOutputSchema, missing.structuredContent));
+		nodes.set(".bulk", [new ElementFixture("😀".repeat(1000))]);
+		const budgetFields = [{ name: "bulk", selector: ".bulk" }, { name: "price", selector: ".price", required: true }];
+		for (const [maxBytes, expected] of [[undefined, 1800], [900, 900], [65536, 1800]] as const) {
+			const limited = await tool.execute("budget", { fields: budgetFields, ...(maxBytes === undefined ? {} : { maxBytes }) });
+			assert.equal(collectionBudget, expected, "the effective budget reaches DOM collection");
+			assert.equal(limited.isError, false);
+			assert.ok(Buffer.byteLength(limited.content[0].text!) <= expected);
+			const output = JSON.parse(limited.content[0].text!) as ExtractionOutput;
+			assert.deepEqual(output, limited.structuredContent);
+			assert.ok(Check(ExtractionOutputSchema, output));
+			assert.equal(output.truncated, true);
+			assert.deepEqual(output.fields[1].values, ["€ 19,90"]);
+			assert.equal(output.fields[1].truncated, false);
+		}
+		const requiredLong = await tool.execute("required-budget", { fields: [{ name: "bulk", selector: ".bulk", required: true }], maxBytes: 900 });
+		assert.equal(requiredLong.isError, true);
+		assert.equal(requiredLong.structuredContent?.fields[0].truncated, true);
+		const tooSmall = await tool.execute("metadata-budget", { fields: budgetFields, maxBytes: 256 });
+		assert.equal(tooSmall.isError, true);
+		assert.match(tooSmall.content[0].text!, /metadata exceeds the output budget/);
 	} finally {
+		if (savedCeiling === undefined) delete process.env.PI_LIGHTPANDA_MAX_BYTES;
+		else process.env.PI_LIGHTPANDA_MAX_BYTES = savedCeiling;
 		await shutdown?.();
 		puppeteer.connect = savedConnect;
 		globalThis.fetch = savedFetch;

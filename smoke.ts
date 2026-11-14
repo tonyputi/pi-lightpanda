@@ -62,7 +62,16 @@ assert.ok(bin, "install Lightpanda first with /lightpanda setup, or set PI_LIGHT
 process.env.PI_LIGHTPANDA_BIN = bin;
 process.env.PI_LIGHTPANDA_HOST = "127.0.0.1";
 process.env.PI_LIGHTPANDA_TIMEOUT_MS = "10000";
+process.env.PI_LIGHTPANDA_MAX_BYTES = "12288";
 const site = createServer((request, response) => {
+	if (request.url === "/budget") {
+		response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+		response.end(`<!doctype html><html><head><title>Output budget fixture</title></head><body>
+<h1>Example Product</h1><span class="price">€ 19,90</span><a class="docs" href="/docs">Docs</a>
+${Array.from({ length: 80 }, (_, index) => `<p>Background ${index}: ${"Harmless repeatable context. ".repeat(3)}</p>`).join("\n")}
+<p>End of budget fixture.</p></body></html>`);
+		return;
+	}
 	if (request.url === "/redirect") {
 		response.writeHead(302, { location: "/" });
 		response.end();
@@ -85,6 +94,26 @@ try {
 	process.env.PI_LIGHTPANDA_PORT = String(managedPort);
 	const managed = harness();
 	try {
+		// Reproducible output-byte evidence: same harmless page, no tokenizer claims.
+		const budgetUrl = `${url}budget`;
+		const full = await managed.call("fetch", { url: budgetUrl, waitMs: 0 });
+		const concise = await managed.call("fetch", { url: budgetUrl, waitMs: 0, maxBytes: 4096 });
+		const selected = await managed.call("extract", { url: budgetUrl, maxBytes: 4096, fields: [
+			{ name: "name", selector: "h1", required: true },
+			{ name: "price", selector: ".price", required: true },
+			{ name: "docs", selector: "a.docs", attribute: "href", required: true },
+		] });
+		const selectedOutput = JSON.parse(selected) as ExtractionOutput;
+		assert.deepEqual(selectedOutput.fields.map((field) => field.values), [["Example Product"], ["€ 19,90"], ["/docs"]]);
+		assert.equal(selectedOutput.complete, true);
+		assert.ok(full.includes("End of budget fixture."), "default fetch fits the whole fixture");
+		assert.ok(!concise.includes("End of budget fixture."), "4 KB fetch omits background material");
+		assert.ok(Buffer.byteLength(concise) <= 4096);
+		for (const [path, text, truncated] of [["default Markdown", full, false], ["4 KB Markdown", concise, true], ["three named fields", selected, selectedOutput.truncated]] as const) {
+			const requiredInfoComplete: boolean = path === "three named fields" ? selectedOutput.complete : ["Example Product", "€ 19,90", "/docs"].every((value) => text.includes(value));
+			assert.equal(requiredInfoComplete, true);
+			console.log(`byte evidence: ${JSON.stringify({ path, utf8Bytes: Buffer.byteLength(text), requiredInfoComplete, truncated })}`);
+		}
 		const extracted = JSON.parse(await managed.call("extract", {
 			url: `${url}redirect`, waitForSelector: ".price",
 			fields: [
@@ -121,16 +150,18 @@ try {
 		} finally { clearTimeout(cancelTimer); }
 		console.log("ok real selector cancellation without losing the browser session");
 		await managed.call("eval", { expression: "(() => { for (let i=0; i<20; i++) { const el=document.createElement('p'); el.className='bulk'; el.textContent='x'.repeat(2048); document.body.appendChild(el); } return 'created'; })()" });
-		for (const priceFirst of [false, true]) {
+		for (const maxBytes of [undefined, 900]) for (const priceFirst of [false, true]) {
 			const fields = [{ name: "bulk", selector: ".bulk", many: true }, { name: "price", selector: ".price", required: true }];
 			if (priceFirst) fields.reverse();
-			const output = JSON.parse(await managed.call("extract", { fields })) as ExtractionOutput;
+			const text = await managed.call("extract", { fields, ...(maxBytes === undefined ? {} : { maxBytes }) });
+			if (maxBytes !== undefined) assert.ok(Buffer.byteLength(text) <= maxBytes);
+			const output = JSON.parse(text) as ExtractionOutput;
 			const price = output.fields.find((field) => field.name === "price")!;
 			assert.deepEqual(price.values, ["€ 19,90"]);
 			assert.equal(price.truncated, false);
 			assert.equal(output.truncated, true, "only the optional list is truncated");
 		}
-		console.log("ok real budget priority: required price survives long lists in either field order");
+		console.log("ok real budget priority: required price survives long lists in either field order, including a 900-byte per-call budget");
 		const snapshot = await managed.call("snapshot");
 		assert.ok(!snapshot.includes("fixture-password-not-for-output"));
 		const refs = [...snapshot.matchAll(/^\[(e\d+)\] button/gm)].map((match) => match[1]);

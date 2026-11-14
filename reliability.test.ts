@@ -1,10 +1,11 @@
 /** Regression tests: fake binaries, HTTP responses and DOM; no network or browser required. */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Check } from "typebox/value";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import puppeteer from "puppeteer-core";
@@ -55,11 +56,15 @@ async function withEnv(patch: NodeJS.ProcessEnv, fn: () => Promise<void>) {
 	}
 }
 
-function nodeBinary(path: string, source: string) {
-	writeFileSync(path, `#!${process.execPath}\n${source}\n`, { mode: 0o755 });
+function nodeBinary(path: string, source: string, nodePath = process.execPath) {
+	// Kernel shebang parsing cannot quote paths containing whitespace. A shell
+	// wrapper can, and also works when the temporary directory contains spaces.
+	const quotedNode = `'${nodePath.replaceAll("'", "'\\''")}'`;
+	writeFileSync(path, `#!/bin/sh\nexec ${quotedNode} - "$@" <<'PI_LIGHTPANDA_NODE_FIXTURE'\n${source}\nPI_LIGHTPANDA_NODE_FIXTURE\n`, { mode: 0o755 });
 }
 
 interface Tool {
+	parameters: Parameters<typeof Check>[0];
 	executionMode?: string;
 	execute(id: string, params: unknown, signal?: AbortSignal): Promise<{ isError?: boolean; content: Array<{ text?: string }> }>;
 }
@@ -77,6 +82,14 @@ function harness() {
 	return { tools, events, commands };
 }
 
+await test("Node fixtures support executable and temporary paths containing spaces", async () => temporary(async (directory) => {
+	const nodePath = join(directory, "Node Application Support's executable");
+	symlinkSync(process.execPath, nodePath);
+	const path = join(directory, "fixture with spaces");
+	nodeBinary(path, "console.log('portable-fixture')", nodePath);
+	assert.equal((await setup.binaryUsable(path)).version, "portable-fixture");
+}));
+
 await test("version checks leave the event loop responsive and respect timeout/abort", async () => temporary(async (directory) => {
 	const path = join(directory, "slow-lightpanda");
 	nodeBinary(path, "setTimeout(() => console.log('slow-fixture'), 150)");
@@ -90,6 +103,36 @@ await test("version checks leave the event loop responsive and respect timeout/a
 	const aborted = setup.binaryUsable(path, { signal: controller.signal });
 	controller.abort();
 	await assert.rejects(aborted, /abort/i);
+}));
+
+await test("fetch per-call budgets use the ceiling, reduce output including markers, and reject invalid values", async () => temporary(async (directory) => {
+	const path = join(directory, "fetch-fixture");
+	const argsPath = join(directory, "args.json");
+	nodeBinary(path, `require('node:fs').writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv.slice(2))); process.stdout.write('😀'.repeat(10000));`);
+	await withEnv({ PI_LIGHTPANDA_BIN: path, PI_LIGHTPANDA_MAX_BYTES: "2048" }, async () => {
+		const tool = harness().tools.get("lightpanda_fetch")!;
+		for (const [maxBytes, expected] of [[undefined, 2048], [512, 512], [65536, 2048]] as const) {
+			const input = { url: "https://fixture.test/", ...(maxBytes === undefined ? {} : { maxBytes }) };
+			assert.ok(Check(tool.parameters, input));
+			const result = await tool.execute("budget", input);
+			assert.ok(!result.isError);
+			const args = JSON.parse(readFileSync(argsPath, "utf8")) as string[];
+			assert.equal(args[args.indexOf("--dump-max-bytes") + 1], String(expected));
+			const text = result.content[0].text!;
+			assert.ok(text.endsWith("[truncated]"));
+			assert.ok(!text.includes("\uFFFD"), "UTF-8 characters remain intact");
+			if (maxBytes !== undefined) assert.ok(Buffer.byteLength(text) <= expected);
+		}
+		for (const maxBytes of [255, 65537, 1.5, NaN, Infinity, "4096", null]) {
+			const input = { url: "https://fixture.test/", maxBytes };
+			assert.equal(Check(tool.parameters, input), false);
+			await assert.rejects(tool.execute("invalid", input), /maxBytes/);
+		}
+	});
+	await withEnv({ PI_LIGHTPANDA_BIN: path, PI_LIGHTPANDA_MAX_BYTES: "128" }, async () => {
+		const result = await harness().tools.get("lightpanda_fetch")!.execute("tiny-ceiling", { url: "https://fixture.test/", maxBytes: 256 });
+		assert.ok(Buffer.byteLength(result.content[0].text!) <= 128, "a global ceiling below the per-call minimum is never expanded");
+	});
 }));
 
 await test("PATH overrides resolve identically for tools, setup and update", async () => temporary(async (directory) => {

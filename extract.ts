@@ -2,6 +2,16 @@
 import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
 
+/** Per-call budgets may reduce, but never expand, the configured ceiling. */
+export const CallMaxBytesSchema = Type.Integer({ minimum: 256, maximum: 65_536, description: "Optional UTF-8 output budget, 256–65536 bytes; can only reduce PI_LIGHTPANDA_MAX_BYTES. Use e.g. 4096 for concise results." });
+
+export function effectiveMaxBytes(ceiling: number, requested?: number): number {
+	if (requested !== undefined && (!Number.isInteger(requested) || requested < 256 || requested > 65_536)) {
+		throw new Error("maxBytes must be an integer between 256 and 65536");
+	}
+	return Math.min(ceiling, requested ?? ceiling);
+}
+
 const FieldSpec = Type.Object({
 	name: Type.String({ minLength: 1, maxLength: 64, pattern: "^[A-Za-z][A-Za-z0-9_-]*$" }),
 	selector: Type.String({ minLength: 1, maxLength: 512, description: "CSS selector; must match one element unless many is true" }),
@@ -13,6 +23,7 @@ const FieldSpec = Type.Object({
 export const ExtractionParamsSchema = Type.Object({
 	url: Type.Optional(Type.String({ minLength: 1, maxLength: 4096, description: "http(s) URL to navigate to; omit to extract from the current page without navigating" })),
 	fields: Type.Array(FieldSpec, { minItems: 1, maxItems: 12 }),
+	maxBytes: Type.Optional(CallMaxBytesSchema),
 	maxValues: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, description: "Maximum values per many field (default 20); extra matches are explicitly marked truncated" })),
 	waitForSelector: Type.Optional(Type.String({ minLength: 1, maxLength: 512, description: "Optional CSS selector to wait for before reading JS-populated content" })),
 }, { additionalProperties: false });
@@ -50,7 +61,7 @@ export const ExtractionOutputSchema = Type.Object({
 export type ExtractionOutput = Static<typeof ExtractionOutputSchema>;
 
 export function validateExtractionParams(value: unknown): asserts value is ExtractionParams {
-	if (!Check(ExtractionParamsSchema, value)) throw new Error("invalid extraction parameters: use 1–12 named CSS fields and maxValues between 1 and 50");
+	if (!Check(ExtractionParamsSchema, value)) throw new Error("invalid extraction parameters: use 1–12 named CSS fields, maxValues between 1 and 50, and optional maxBytes between 256 and 65536");
 	if (new Set(value.fields.map((field) => field.name)).size !== value.fields.length) throw new Error("extraction field names must be unique");
 	if (value.fields.some((field) => !field.selector.trim()) || value.waitForSelector !== undefined && !value.waitForSelector.trim()) throw new Error("CSS selectors cannot be blank");
 	if (value.url !== undefined) {
@@ -165,7 +176,7 @@ export function fitExtraction(output: ExtractionOutput, maxBytes: number, requir
 	summary(bounded);
 	// Replacing true with false costs one extra byte per flag. Reserve that cost.
 	let remaining = maxBytes - size(bounded) - bounded.fields.length - 2;
-	if (remaining < 0) throw new Error("extraction metadata exceeds the output budget; request fewer/shorter fields or increase PI_LIGHTPANDA_MAX_BYTES");
+	if (remaining < 0) throw new Error("extraction metadata exceeds the output budget; request fewer/shorter fields, raise maxBytes if supplied, or increase PI_LIGHTPANDA_MAX_BYTES");
 	const entries = output.fields.map((original, index) => {
 		bounded.fields[index].truncated = original.truncated;
 		const values = original.values.map((value, index) => ({ value, index, cost: typeof value === "string" ? size(value) - 2 : 0 }))
