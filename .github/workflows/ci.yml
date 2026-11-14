@@ -25,16 +25,23 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   test:
+    # Preserve existing required-check names while extending the platform matrix.
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-        node: ['22.19.0', '24']
         include:
+          - os: ubuntu-latest
+            node: '22.19.0'
+            name: test (22)
+          - os: ubuntu-latest
+            node: '24'
+            name: test (24)
           - os: macos-latest
             node: '24'
+            name: test (macos-latest, 24)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
