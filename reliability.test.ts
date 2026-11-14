@@ -1,86 +1,15 @@
 /** Regression tests: fake binaries, HTTP responses and DOM; no network or browser required. */
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { Check } from "typebox/value";
 import { setTimeout as delay } from "node:timers/promises";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import puppeteer from "puppeteer-core";
-import extension, { _internals as browser } from "./index.ts";
-import { _setupInternals as setup, type WizardUI } from "./setup.ts";
-
-const asset = "lightpanda-x86_64-linux";
-const digest = (bytes: Uint8Array | string) => createHash("sha256").update(bytes).digest("hex");
-const binaryBytes = (command = "echo lightpanda-regression-fixture") => Buffer.concat([
-	Buffer.from(`#!/bin/sh\n${command}\n#`), Buffer.alloc(1024 * 1024, 0x78),
-]);
-const metadata = (sha256: string) => new Response(JSON.stringify({
-	assets: [{ name: asset, digest: `sha256:${sha256}`, updated_at: "2026-10-14T00:00:00Z" }],
-}), { headers: { "content-type": "application/json" } });
-const assetFetcher = (bytes: Buffer, sha256 = digest(bytes)): typeof fetch => async (input) =>
-	String(input).includes("api.github.com") ? metadata(sha256) : new Response(new Uint8Array(bytes), {
-		headers: { "content-length": String(bytes.length) },
-	});
-
-function fakeUi(answer = true) {
-	const notifications: Array<{ message: string; type?: string }> = [];
-	const statuses: Array<string | undefined> = [];
-	const prompts: string[] = [];
-	const ui: WizardUI = {
-		confirm: async (_title, message) => { prompts.push(message); return answer; },
-		notify: (message, type) => { notifications.push({ message, type }); },
-		setStatus: (_key, text) => { statuses.push(text); },
-	};
-	return { ui, notifications, statuses, prompts };
-}
-
-async function temporary(fn: (directory: string) => Promise<void>) {
-	const directory = mkdtempSync(join(tmpdir(), "pi-lightpanda-regression-"));
-	try { await fn(directory); }
-	finally { rmSync(directory, { recursive: true, force: true }); }
-}
-
-async function withEnv(patch: NodeJS.ProcessEnv, fn: () => Promise<void>) {
-	const saved = Object.keys(patch).map((key) => [key, process.env[key]] as const);
-	for (const [key, value] of Object.entries(patch)) {
-		if (value === undefined) delete process.env[key]; else process.env[key] = value;
-	}
-	try { await fn(); }
-	finally {
-		for (const [key, value] of saved) {
-			if (value === undefined) delete process.env[key]; else process.env[key] = value;
-		}
-	}
-}
-
-function nodeBinary(path: string, source: string, nodePath = process.execPath) {
-	// Kernel shebang parsing cannot quote paths containing whitespace. A shell
-	// wrapper can, and also works when the temporary directory contains spaces.
-	const quotedNode = `'${nodePath.replaceAll("'", "'\\''")}'`;
-	writeFileSync(path, `#!/bin/sh\nexec ${quotedNode} - "$@" <<'PI_LIGHTPANDA_NODE_FIXTURE'\n${source}\nPI_LIGHTPANDA_NODE_FIXTURE\n`, { mode: 0o755 });
-}
-
-interface Tool {
-	parameters: Parameters<typeof Check>[0];
-	executionMode?: string;
-	execute(id: string, params: unknown, signal?: AbortSignal): Promise<{ isError?: boolean; content: Array<{ text?: string }> }>;
-}
-type Context = { hasUI: boolean; ui: WizardUI };
-type Handler = (event: unknown, ctx: Context) => unknown;
-function harness() {
-	const tools = new Map<string, Tool>();
-	const events = new Map<string, Handler>();
-	const commands = new Map<string, { handler: (args: string, ctx: Context) => Promise<void> }>();
-	extension({
-		registerTool: (tool: Tool & { name: string }) => tools.set(tool.name, tool),
-		registerCommand: (name: string, command: { handler: (args: string, ctx: Context) => Promise<void> }) => commands.set(name, command),
-		on: (name: string, handler: Handler) => events.set(name, handler),
-	} as unknown as ExtensionAPI);
-	return { tools, events, commands };
-}
+import { _internals as browser } from "./index.ts";
+import { createBrowserSession } from "./browser.ts";
+import * as setup from "./setup.ts";
+import { assetFetcher, binaryBytes, digest, fakeUi, harness, metadata, nodeBinary, temporary, withEnv } from "./test-support.ts";
 
 await test("Node fixtures support executable and temporary paths containing spaces", async () => temporary(async (directory) => {
 	const nodePath = join(directory, "Node Application Support's executable");
@@ -139,7 +68,7 @@ await test("PATH overrides resolve identically for tools, setup and update", asy
 	const path = join(directory, "custom-lightpanda");
 	nodeBinary(path, "console.log('path-fixture')");
 	const env = { PI_LIGHTPANDA_BIN: "custom-lightpanda", PATH: directory };
-	assert.equal(browser.resolveBin(env), path);
+	assert.equal(setup.resolveBin(env), path);
 	assert.equal(await setup.findInstalledBinary(env), path);
 	assert.equal(setup.installTarget(env), path);
 	const result = await setup.runSetupWizard(fakeUi().ui, { env, platform: "linux", arch: "x64" });
@@ -276,6 +205,7 @@ await test("setup verifies and installs a binary, and a late abort cannot replac
 
 const config = { host: "127.0.0.1", port: 65530, timeoutMs: 1500, maxBytes: 12000, maxRefs: 50 };
 await test("missing/non-executable/early-exit servers return errors instead of crashing Pi", async () => temporary(async (directory) => {
+	const server = createBrowserSession();
 	const savedFetch = globalThis.fetch;
 	globalThis.fetch = async () => new Response("", { status: 404 });
 	try {
@@ -285,52 +215,54 @@ await test("missing/non-executable/early-exit servers return errors instead of c
 		nodeBinary(earlyExit, "process.exit(7)");
 		for (const path of [join(directory, "missing"), notExecutable, earlyExit]) {
 			await withEnv({ PI_LIGHTPANDA_BIN: path }, async () => {
-				const result = await browser.ensureServer(config);
+				const result = await server.ensureServer(config);
 				assert.ok("error" in result);
 				if (path === earlyExit) assert.match(result.error, /7/);
 				else assert.match(result.error, /setup/);
-				assert.equal(await browser.stopManagedServer(), false, "failed spawn left no managed server");
+				assert.equal(await server.stopManagedServer(), false, "failed spawn left no managed server");
 			});
 		}
 	} finally {
-		await browser.stopManagedServer();
+		await server.stopManagedServer();
 		globalThis.fetch = savedFetch;
 	}
 }));
 
 await test("readiness timeout terminates the unresponsive managed child", async () => temporary(async (directory) => {
+	const server = createBrowserSession();
 	const path = join(directory, "server");
 	nodeBinary(path, "setInterval(() => {}, 1000)");
 	const savedFetch = globalThis.fetch;
 	globalThis.fetch = async () => new Response("", { status: 404 });
 	try {
 		await withEnv({ PI_LIGHTPANDA_BIN: path }, async () => {
-			const result = await browser.ensureServer({ ...config, timeoutMs: 150 });
+			const result = await server.ensureServer({ ...config, timeoutMs: 150 });
 			assert.ok("error" in result && /within 150ms/.test(result.error));
-			assert.equal(await browser.stopManagedServer(), false, "timed-out child was already reaped");
+			assert.equal(await server.stopManagedServer(), false, "timed-out child was already reaped");
 		});
 	} finally {
-		await browser.stopManagedServer();
+		await server.stopManagedServer();
 		globalThis.fetch = savedFetch;
 	}
 }));
 
-await test("concurrent server starts share one child and stopping waits for its exit", async () => temporary(async (directory) => {
+await test("concurrent starts share one child and shutdown escalates if it ignores SIGTERM", async () => temporary(async (directory) => {
+	const server = createBrowserSession();
 	const path = join(directory, "server");
 	const count = join(directory, "starts");
-	nodeBinary(path, `require('node:fs').appendFileSync(${JSON.stringify(count)}, 'start\\n'); setInterval(() => {}, 1000);`);
+	nodeBinary(path, `process.on('SIGTERM', () => {}); require('node:fs').appendFileSync(${JSON.stringify(count)}, 'start\\n'); setInterval(() => {}, 1000);`);
 	const savedFetch = globalThis.fetch;
 	globalThis.fetch = async () => existsSync(count) ? Response.json({ Browser: "fake-browser" }) : new Response("", { status: 404 });
 	try {
 		await withEnv({ PI_LIGHTPANDA_BIN: path }, async () => {
-			const results = await Promise.all([browser.ensureServer(config), browser.ensureServer(config)]);
+			const results = await Promise.all([server.ensureServer(config), server.ensureServer(config)]);
 			for (const result of results) assert.deepEqual(result, { reused: false });
 			assert.equal(readFileSync(count, "utf8"), "start\n");
-			assert.equal(await browser.stopManagedServer(), true);
-			assert.equal(await browser.stopManagedServer(), false);
+			assert.equal(await server.stopManagedServer(), true);
+			assert.equal(await server.stopManagedServer(), false);
 		});
 	} finally {
-		await browser.stopManagedServer();
+		await server.stopManagedServer();
 		globalThis.fetch = savedFetch;
 	}
 }));
@@ -349,11 +281,9 @@ await test("session shutdown cancels a pending server startup", async () => temp
 			await delay(30);
 			await pi.events.get("session_shutdown")!({}, ctx);
 			await starting;
-			assert.equal(await browser.stopManagedServer(), false);
 			assert.ok(ui.notifications.some(({ message }) => /cancelled|exited/.test(message)));
 		});
 	} finally {
-		await browser.stopManagedServer();
 		globalThis.fetch = savedFetch;
 	}
 }));
@@ -468,7 +398,6 @@ await test("disconnect disposes only the owned context, even if context cleanup 
 	} finally {
 		puppeteer.connect = savedConnect;
 		globalThis.fetch = savedFetch;
-		await browser.closePage();
 	}
 });
 
@@ -494,12 +423,11 @@ await test("a CDP connection completing after shutdown is disconnected, not publ
 		assert.equal((await navigation).isError, true);
 		assert.equal(contextOpened, false);
 		assert.equal(disconnected, 1);
-		await browser.closePage();
+		await pi.events.get("session_shutdown")!({}, ctx);
 		assert.equal(disconnected, 1, "late connection was never published into shared state");
 	} finally {
 		puppeteer.connect = savedConnect;
 		globalThis.fetch = savedFetch;
-		await browser.closePage();
 	}
 });
 

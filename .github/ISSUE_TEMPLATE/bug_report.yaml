@@ -30,7 +30,7 @@ body:
       description: Name the failing tool or command. A public test URL or minimal HTML fixture helps; do not include private pages or authenticated sessions.
       placeholder: |
         1. Run /lightpanda setup or start with an installed binary.
-        2. Call lightpanda_fetch / navigate / snapshot / act / eval / run, or a /lightpanda subcommand.
+        2. Call lightpanda_fetch / extract / navigate / snapshot / act / eval / run, or a /lightpanda subcommand.
         3. …
     validations:
       required: true
@@ -38,7 +38,7 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: Pi version, pi-lightpanda version, Lightpanda version (shown by /lightpanda status), OS/architecture, and installation source (npm, git, or local checkout).
+      description: Node and Pi versions, pi-lightpanda version, Lightpanda version (shown by /lightpanda status), OS/architecture, and installation source (npm, git, or local checkout).
       render: shell
     validations:
       required: true

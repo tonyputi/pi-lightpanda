@@ -1,92 +1,37 @@
 /**
- * pi-lightpanda — a lightweight headless browser for the Pi agent via Lightpanda.
- *
- * Lightpanda (lightpanda.io) is a headless browser built from scratch for
- * machines, with a Chrome DevTools Protocol (CDP) server the agent can drive.
- * Upstream reports ~16x lower peak memory and ~9x faster execution in its
- * crawler benchmark; these are not measurements of this Pi extension.
- *
- * What this extension gives Pi:
- *   - `lightpanda_fetch`     one-shot page dump (markdown/html/text tree) via
- *                            `lightpanda fetch` — no server needed, cheapest path
- *   - `lightpanda_navigate`  navigate the persistent CDP page
- *   - `lightpanda_snapshot`  list interactive elements (refs) + page text
- *   - `lightpanda_act`       click / fill / type / select / press / hover by
- *                            ref (from the last snapshot) or CSS selector
- *   - `lightpanda_extract`   named CSS fields as validated JSON with provenance
- *   - `lightpanda_eval`      evaluate JavaScript in the page, return JSON
- *   - `lightpanda_run`       run a trusted PandaScript file (`lightpanda run`)
- *   - `lightpanda_status`    binary / server / page health (also /lightpanda)
- *
- * Design notes (mirrors pi-github-app-auth: few files, no build, stdlib-first):
- *   - `puppeteer-core` is the runtime CDP client and ships no browser, so it
- *     does not drag Chromium back in. Tool schemas use the host-provided
- *     `typebox` peer. Everything else is Node built-ins + the Pi API.
- *   - One persistent page per session (browser context + page opened on first
- *     use), so logins and state survive across tool calls. The `serve`
- *     subprocess is spawned on demand (loopback only) and killed on
- *     `session_shutdown` — but only if *we* spawned it. An already-running
- *     server is reused untouched.
- *   - All tool output is truncated (default 12 KB text / 50 refs) so a huge
- *     page can never blow up the LLM context.
- *   - Loopback-only guard: PI_LIGHTPANDA_HOST must be 127.0.0.1 / localhost /
- *     ::1. CDP grants full control of the browser (cookies, sessions), so a
- *     remote endpoint is refused outright.
- *   - Lightpanda has partial Web API coverage and no graphical rendering:
- *     complex sites may fail and screenshots are not offered. When a page
- *     needs full Chromium, use a Chromium-backed extension instead.
- *
- * Setup runs entirely inside Pi: /lightpanda setup downloads the nightly
- * binary to ~/.pi/agent/bin/lightpanda and verifies it — after that the tools
- * work immediately, no restart and no .envrc needed.
- *
- * Configuration (environment variables, e.g. via direnv):
- *   PI_LIGHTPANDA_BIN           path to the `lightpanda` binary (optional —
- *                               resolution order at call time: this variable,
- *                               then ~/.pi/agent/bin/lightpanda, then PATH)
- *   PI_LIGHTPANDA_HOST          CDP host, loopback only (default 127.0.0.1)
- *   PI_LIGHTPANDA_PORT          CDP port (default 9222)
- *   PI_LIGHTPANDA_TIMEOUT_MS    per-operation timeout (default 30000)
- *   PI_LIGHTPANDA_MAX_BYTES     max text bytes returned per tool (default 12288)
- *   PI_LIGHTPANDA_MAX_REFS      max snapshot refs (default 50)
+ * Pi tool registration and orchestration for Lightpanda.
+ * Browser/process ownership: browser.ts. Verified installation: setup.ts.
+ * Structured extraction: extract.ts. User contract and diagrams: README.md
+ * and docs/architecture.md. Keep defaults in readConfig, not duplicated prose.
  */
 
-import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { setTimeout as delay } from "node:timers/promises";
+import { execFile } from "node:child_process";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import puppeteer, { type Browser, type BrowserContext, type Page } from "puppeteer-core";
+import type { Page } from "puppeteer-core";
+import { createBrowserSession, probeServer, type BrowserConfig, type BrowserSession } from "./browser.ts";
 import { Type } from "typebox";
 import { binaryUsable, checkForUpdate, resolveBin, runSetupWizard, runUpdateWizard, type WizardUI } from "./setup.ts";
 import { CallMaxBytesSchema, effectiveMaxBytes, collectExtraction, extractionFailed, ExtractionOutputSchema, ExtractionParamsSchema, prepareExtraction, validateExtractionParams } from "./extract.ts";
 
 // --- config ----------------------------------------------------------------
 
-interface LightpandaConfig {
-	host: string;
-	port: number;
-	timeoutMs: number;
+interface LightpandaConfig extends BrowserConfig {
 	maxBytes: number;
 	maxRefs: number;
 }
 
 const DEFAULT_PORT = 9222;
 const DEFAULT_TIMEOUT_MS = 30_000;
+const MAX_TIMEOUT_MS = 2_147_483_647 - 10_000; // Node timer limit minus the CLI grace period.
 const DEFAULT_MAX_BYTES = 12_288;
 const DEFAULT_MAX_REFS = 50;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 
-function parsePort(raw: string | undefined): number | null {
-	if (raw === undefined || raw.trim() === "") return DEFAULT_PORT;
-	const n = Number.parseInt(raw.trim(), 10);
-	if (!Number.isInteger(n) || n < 1 || n > 65535) return null;
-	return n;
-}
-
-function parsePositiveInt(raw: string | undefined, fallback: number): number | null {
+function parsePositiveInt(raw: string | undefined, fallback: number, maximum = Number.MAX_SAFE_INTEGER): number | null {
 	if (raw === undefined || raw.trim() === "") return fallback;
-	const n = Number.parseInt(raw.trim(), 10);
-	if (!Number.isInteger(n) || n <= 0) return null;
-	return n;
+	if (!/^\d+$/.test(raw.trim())) return null;
+	const value = Number(raw);
+	return Number.isSafeInteger(value) && value > 0 && value <= maximum ? value : null;
 }
 
 function readConfig(env: NodeJS.ProcessEnv = process.env): { config: LightpandaConfig; error?: undefined } | { config?: undefined; error: string } {
@@ -94,10 +39,10 @@ function readConfig(env: NodeJS.ProcessEnv = process.env): { config: LightpandaC
 	if (!LOOPBACK_HOSTS.has(host)) {
 		return { error: `PI_LIGHTPANDA_HOST must be loopback (127.0.0.1, localhost, ::1) — got "${host}"` };
 	}
-	const port = parsePort(env.PI_LIGHTPANDA_PORT);
+	const port = parsePositiveInt(env.PI_LIGHTPANDA_PORT, DEFAULT_PORT, 65535);
 	if (port === null) return { error: `PI_LIGHTPANDA_PORT must be 1-65535 — got "${env.PI_LIGHTPANDA_PORT}"` };
-	const timeoutMs = parsePositiveInt(env.PI_LIGHTPANDA_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
-	if (timeoutMs === null) return { error: `PI_LIGHTPANDA_TIMEOUT_MS must be a positive integer — got "${env.PI_LIGHTPANDA_TIMEOUT_MS}"` };
+	const timeoutMs = parsePositiveInt(env.PI_LIGHTPANDA_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+	if (timeoutMs === null) return { error: `PI_LIGHTPANDA_TIMEOUT_MS must be 1-${MAX_TIMEOUT_MS} — got "${env.PI_LIGHTPANDA_TIMEOUT_MS}"` };
 	const maxBytes = parsePositiveInt(env.PI_LIGHTPANDA_MAX_BYTES, DEFAULT_MAX_BYTES);
 	if (maxBytes === null) return { error: `PI_LIGHTPANDA_MAX_BYTES must be a positive integer — got "${env.PI_LIGHTPANDA_MAX_BYTES}"` };
 	const maxRefs = parsePositiveInt(env.PI_LIGHTPANDA_MAX_REFS, DEFAULT_MAX_REFS);
@@ -161,7 +106,7 @@ function formatSnapshot(refs: SnapshotRef[], pageText: string, maxBytes: number)
  * Self-contained (no closures) so puppeteer can serialize it.
  */
 function collectSnapshot(maxRefs: number, maxBytes: number): { refs: SnapshotRef[]; text: string } {
-	const els = Array.from(document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick]'));
+	const els = document.querySelectorAll('a, button, input, select, textarea, [role="button"], [onclick]');
 	// Stable markers avoid ambiguous classes/IDs and do not shift when siblings move.
 	const attribute = "data-pi-lightpanda-ref";
 	for (const old of document.querySelectorAll(`[${attribute}]`)) old.removeAttribute(attribute);
@@ -175,7 +120,7 @@ function collectSnapshot(maxRefs: number, maxBytes: number): { refs: SnapshotRef
 		const tag = el.tagName.toLowerCase();
 		const htmlEl = el as HTMLElement & { value?: string };
 		const value = el.getAttribute("type")?.toLowerCase() === "password" ? "" : htmlEl.value;
-		const text = ((htmlEl.innerText || value || el.getAttribute("aria-label") || el.getAttribute("placeholder") || "") as string)
+		const text = (htmlEl.innerText || value || el.getAttribute("aria-label") || el.getAttribute("placeholder") || "")
 			.trim()
 			.replace(/\s+/g, " ")
 			.slice(0, 120);
@@ -197,184 +142,6 @@ function collectSnapshot(maxRefs: number, maxBytes: number): { refs: SnapshotRef
 
 // --- binary + server lifecycle ----------------------------------------------
 
-function endpointUrl(config: LightpandaConfig): string {
-	const host = config.host.includes(":") ? `[${config.host}]` : config.host;
-	return `ws://${host}:${config.port}`;
-}
-
-function httpBase(config: LightpandaConfig): string {
-	const host = config.host.includes(":") ? `[${config.host}]` : config.host;
-	return `http://${host}:${config.port}`;
-}
-
-async function probeServer(config: LightpandaConfig, parentSignal?: AbortSignal): Promise<{ ok: boolean; version?: string }> {
-	try {
-		const timeout = AbortSignal.timeout(3000);
-		const res = await fetch(`${httpBase(config)}/json/version`, { signal: parentSignal ? AbortSignal.any([timeout, parentSignal]) : timeout });
-		if (!res.ok) return { ok: false };
-		const data = (await res.json().catch(() => null)) as { Browser?: unknown } | null;
-		return { ok: true, version: typeof data?.Browser === "string" ? data.Browser : undefined };
-	} catch {
-		return { ok: false };
-	}
-}
-
-let serverChild: ChildProcess | null = null;
-let serverOurs = false;
-
-async function waitForServer(config: LightpandaConfig, timeoutMs: number, parentSignal?: AbortSignal): Promise<boolean> {
-	const timeout = AbortSignal.timeout(timeoutMs);
-	const signal = parentSignal ? AbortSignal.any([timeout, parentSignal]) : timeout;
-	while (!signal.aborted) {
-		if ((await probeServer(config, signal)).ok && !signal.aborted) return true;
-		await delay(100, undefined, { signal }).catch(() => {});
-	}
-	return false;
-}
-
-type ServerResult = { reused: boolean } | { error: string };
-let serverStarting: Promise<ServerResult> | null = null;
-
-/** Share startup even if callers bypass Pi's sequential tool scheduling. */
-async function ensureServer(config: LightpandaConfig, signal?: AbortSignal): Promise<ServerResult> {
-	if (serverStarting) return serverStarting;
-	const starting = startServer(config, signal);
-	serverStarting = starting;
-	try { return await starting; }
-	finally { if (serverStarting === starting) serverStarting = null; }
-}
-
-async function startServer(config: LightpandaConfig, signal?: AbortSignal): Promise<ServerResult> {
-	if (signal?.aborted) return { error: "server startup cancelled" };
-	const existing = await probeServer(config, signal);
-	if (signal?.aborted) return { error: "server startup cancelled" };
-	if (existing.ok) return { reused: true };
-	if (serverChild && serverOurs) {
-		if (await waitForServer(config, Math.min(config.timeoutMs, 5000), signal)) return { reused: false };
-		return { error: `the managed lightpanda server on port ${config.port} is not responding` };
-	}
-	const bin = resolveBin();
-	let child: ChildProcess;
-	try {
-		child = spawn(bin, ["serve", "--host", config.host, "--port", String(config.port)], {
-			stdio: "ignore", detached: process.platform !== "win32",
-		});
-	} catch (err) {
-		return { error: `could not spawn "${bin} serve" — run /lightpanda setup: ${err instanceof Error ? err.message : String(err)}` };
-	}
-	const exited = new AbortController();
-	let failure: string | undefined;
-	const clear = () => {
-		if (serverChild === child) { serverChild = null; serverOurs = false; }
-	};
-	// spawn() reports ENOENT/EACCES asynchronously, outside the try/catch above.
-	child.once("error", (err) => {
-		failure = `could not spawn "${bin} serve" — run /lightpanda setup: ${err.message}`;
-		clear();
-		exited.abort();
-	});
-	child.once("exit", (code, sig) => {
-		failure = `"${bin} serve" exited before becoming ready (${sig ?? code})`;
-		clear();
-		exited.abort();
-	});
-	serverChild = child;
-	serverOurs = true;
-	child.unref();
-	const startupSignal = signal ? AbortSignal.any([signal, exited.signal]) : exited.signal;
-	const startupTimeoutMs = Math.min(config.timeoutMs, 15_000);
-	if (await waitForServer(config, startupTimeoutMs, startupSignal)) return { reused: false };
-	const error = failure ?? (signal?.aborted ? "server startup cancelled" : `"${bin} serve" did not answer on ${config.host}:${config.port} within ${startupTimeoutMs}ms`);
-	if (serverChild === child) await stopManagedServer();
-	return { error };
-}
-
-function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
-	if (!child.pid || child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
-	return new Promise((resolve) => {
-		const finish = (exited: boolean) => {
-			clearTimeout(timer);
-			child.removeListener("exit", onExit);
-			child.removeListener("error", onExit);
-			resolve(exited);
-		};
-		const onExit = () => finish(true);
-		const timer = setTimeout(() => finish(false), timeoutMs);
-		child.once("exit", onExit);
-		child.once("error", onExit);
-	});
-}
-
-async function stopManagedServer(): Promise<boolean> {
-	const child = serverChild;
-	if (!child || !serverOurs) return false;
-	const exited = waitForExit(child, 2000);
-	child.kill();
-	if (!(await exited)) {
-		const killed = waitForExit(child, 1000);
-		child.kill("SIGKILL");
-		if (!(await killed)) throw new Error("managed Lightpanda server did not stop; refusing to start a second server");
-	}
-	if (serverChild === child) { serverChild = null; serverOurs = false; }
-	return true;
-}
-
-// --- persistent page via puppeteer-core (Lightpanda's documented CDP path) ---
-
-let browser: Browser | null = null;
-let context: BrowserContext | null = null;
-let page: Page | null = null;
-
-function dropPage(): void {
-	browser = null;
-	context = null;
-	page = null;
-}
-
-async function closePage(): Promise<void> {
-	const b = browser;
-	const ownedContext = context;
-	dropPage();
-	try { await ownedContext?.close(); }
-	catch { /* already gone */ }
-	finally { await b?.disconnect().catch(() => {}); }
-}
-
-function isPageAlive(): boolean {
-	return !!page && !page.isClosed();
-}
-
-/** One browser context + one page per session, shared by all tools. */
-async function ensurePage(config: LightpandaConfig, signal?: AbortSignal): Promise<{ page: Page; fresh: boolean } | { error: string }> {
-	const srv = await ensureServer(config, signal);
-	if ("error" in srv) return srv;
-	if (signal?.aborted) return { error: "browser operation cancelled" };
-	if (isPageAlive()) return { page: page!, fresh: false };
-	await closePage().catch(() => {});
-	// Do not publish half-open resources: a late connection must not resurrect
-	// a shut-down session or clean up a newer session's browser by accident.
-	let openedBrowser: Browser | undefined;
-	let openedContext: BrowserContext | undefined;
-	try {
-		signal?.throwIfAborted();
-		openedBrowser = await puppeteer.connect({ browserWSEndpoint: endpointUrl(config), protocolTimeout: config.timeoutMs });
-		signal?.throwIfAborted();
-		openedContext = await openedBrowser.createBrowserContext();
-		signal?.throwIfAborted();
-		const openedPage = await openedContext.newPage();
-		signal?.throwIfAborted();
-		openedPage.setDefaultTimeout(config.timeoutMs);
-		browser = openedBrowser;
-		context = openedContext;
-		page = openedPage;
-		return { page: openedPage, fresh: true };
-	} catch (err) {
-		await openedContext?.close().catch(() => {});
-		await openedBrowser?.disconnect().catch(() => {});
-		return { error: `could not open a Lightpanda page: ${err instanceof Error ? err.message : String(err)}` };
-	}
-}
-
 /** Best-effort ready wait: domcontentloaded already happened in goto. */
 async function waitForReady(p: Page, timeoutMs: number, signal?: AbortSignal): Promise<void> {
 	signal?.throwIfAborted();
@@ -389,13 +156,9 @@ async function waitForReady(p: Page, timeoutMs: number, signal?: AbortSignal): P
 
 // --- fetch via CLI (no server needed) -----------------------------------------
 
-function fetchArgs(url: string, format: string, waitMs: number, maxBytes: number): string[] {
-	return ["fetch", url, "--dump", format, "--dump-max-bytes", String(maxBytes), "--wait-ms", String(waitMs)];
-}
-
 function runFetch(config: LightpandaConfig, url: string, format: string, waitMs: number, maxBytes: number, signal?: AbortSignal): Promise<{ text: string } | { error: string }> {
 	return new Promise((resolve) => {
-		execFile(resolveBin(), fetchArgs(url, format, waitMs, maxBytes), { timeout: config.timeoutMs + 10_000, maxBuffer: 16 * 1024 * 1024, signal }, (err, stdout, stderr) => {
+		execFile(resolveBin(), ["fetch", url, "--dump", format, "--dump-max-bytes", String(maxBytes), "--wait-ms", String(waitMs)], { timeout: config.timeoutMs + 10_000, maxBuffer: 16 * 1024 * 1024, signal }, (err, stdout, stderr) => {
 			if (err) {
 				const detail = (stderr?.toString().trim() || err.message).slice(0, 500);
 				resolve({ error: `lightpanda fetch failed: ${detail}${/ENOENT/.test(detail) ? " — binary not found, run /lightpanda setup" : ""}` });
@@ -416,15 +179,9 @@ function errorResult(message: string) {
 	return { ...textResult(`error: ${message}`), isError: true };
 }
 
-async function toolError(err: unknown, what: string) {
-	const msg = err instanceof Error ? err.message : String(err);
-	if (/closed|disconnected|detached|Target closed|Session closed|not connected/i.test(msg)) await closePage();
-	return errorResult(`${what}: ${msg.slice(0, 800)}`);
-}
-
 // --- setup command (/lightpanda setup) -----------------------------------------
 
-/** Install/verify the Lightpanda binary, entirely inside Pi — mirrors pi-github-app-auth's wizard pattern. */
+/** Install/verify the Lightpanda binary with explicit confirmation inside Pi. */
 async function runSetupCommand(ctx: ExtensionCommandContext, signal?: AbortSignal): Promise<void> {
 	if (!ctx.hasUI) {
 		ctx.ui.notify(
@@ -485,7 +242,7 @@ async function restartAfterUpdate(ui: WizardUI, runtime: {
 	ui.notify(result.error ? `lightpanda: binary updated, but browser restart failed — ${result.error}` : "lightpanda: managed browser restarted with the updated binary; take a fresh snapshot.", result.error ? "error" : "info");
 }
 
-async function runUpdateCommand(ctx: ExtensionCommandContext, cfg: LightpandaConfig, invalidateRefs: () => void, signal?: AbortSignal): Promise<void> {
+async function runUpdateCommand(ctx: ExtensionCommandContext, cfg: LightpandaConfig, session: BrowserSession, invalidateRefs: () => void, signal?: AbortSignal): Promise<void> {
 	if (!ctx.hasUI) {
 		ctx.ui.notify("lightpanda: update needs an interactive session so you can confirm replacing the binary.", "warning");
 		return;
@@ -501,13 +258,13 @@ async function runUpdateCommand(ctx: ExtensionCommandContext, cfg: LightpandaCon
 		} else {
 			ui.notify(`lightpanda: binary updated to ${result.version} at ${result.target}.`, "info");
 			await restartAfterUpdate(ui, {
-				managed: serverOurs && !!serverChild,
-				external: !serverOurs && (await probeServer(cfg, signal)).ok,
+				managed: session.managed,
+				external: !session.managed && (await probeServer(cfg, signal)).ok,
 				restart: async () => {
 					invalidateRefs();
-					await closePage();
-					await stopManagedServer();
-					const restarted = await ensureServer(cfg, signal);
+					await session.closePage();
+					await session.stopManagedServer();
+					const restarted = await session.ensureServer(cfg, signal);
 					return "error" in restarted ? restarted : {};
 				},
 			}, signal);
@@ -533,6 +290,13 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 		return;
 	}
 	const cfg = loaded.config;
+	const session = createBrowserSession();
+	const { ensureServer, stopManagedServer, ensurePage, closePage, isPageAlive } = session;
+	const toolError = async (err: unknown, what: string) => {
+		const message = err instanceof Error ? err.message : String(err);
+		if (/closed|disconnected|detached|Target closed|Session closed|not connected/i.test(message)) await closePage();
+		return errorResult(`${what}: ${message.slice(0, 800)}`);
+	};
 
 	// ref -> selector map from the last snapshot (per session, in memory).
 	let refMap = new Map<string, string>();
@@ -553,7 +317,7 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 		promptSnippet: "Fetch pages with lightpanda_fetch (lightweight, no server)",
 		promptGuidelines: ["Prefer lightpanda_fetch for read-only page access; use navigate/snapshot/act only for multi-step interaction. Request a smaller maxBytes (e.g. 4096) on lightpanda_fetch when only a concise result is needed."],
 		async execute(_toolCallId, params, signal) {
-			const p = params as { url: string; format?: string; waitMs?: number; maxBytes?: number };
+			const p = params;
 			const budget = effectiveMaxBytes(cfg.maxBytes, p.maxBytes);
 			if (!isHttpUrl(p.url)) return errorResult(`refusing non-http(s) URL "${p.url}"`);
 			const format = p.format ?? "markdown";
@@ -580,7 +344,7 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 		}),
 		async execute(_toolCallId, params, signal) {
 			signal = operationSignal(signal);
-			const p = params as { url: string };
+			const p = params;
 			if (!isHttpUrl(p.url)) return errorResult(`refusing non-http(s) URL "${p.url}"`);
 			refMap.clear();
 			const held = await ensurePage(cfg, signal);
@@ -589,7 +353,6 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 				await held.page.goto(p.url, { waitUntil: "domcontentloaded", timeout: cfg.timeoutMs, signal });
 				await waitForReady(held.page, 10_000, signal);
 				const title = await held.page.title().catch(() => "");
-				refMap = new Map();
 				return textResult(`ok: ${held.page.url()}${title ? ` — "${title.slice(0, 200)}"` : ""}`);
 			} catch (err) {
 				return toolError(err, "navigate failed");
@@ -631,7 +394,7 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 		}),
 		async execute(_toolCallId, params, signal) {
 			signal = operationSignal(signal);
-			const p = params as { action: string; target: string; value?: string };
+			const p = params;
 			const isRef = /^e\d+$/.test(p.target);
 			if (isRef && !refMap.has(p.target)) return errorResult("unknown or stale reference — run lightpanda_snapshot first");
 			const selector = refMap.get(p.target) ?? p.target;
@@ -667,7 +430,6 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 					await pg.keyboard.press(key);
 				} else return errorResult(`unknown action "${p.action}"`);
 				await waitForReady(pg, 5000, signal);
-				refMap = new Map(); // stale — force a fresh snapshot next
 				return textResult(`ok: ${p.action} ${p.target} — re-run lightpanda_snapshot to see the result`);
 			} catch (err) {
 				return toolError(err, "act failed");
@@ -727,14 +489,14 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 		}),
 		async execute(_toolCallId, params, signal) {
 			signal = operationSignal(signal);
-			const p = params as { expression: string };
+			const p = params;
 			if (!p.expression.trim()) return errorResult("empty expression");
 			if (p.expression.length > 4000) return errorResult("expression too long (max 4000 chars)");
 			refMap.clear(); // arbitrary JavaScript can invalidate snapshot targets
 			const held = await ensurePage(cfg, signal);
 			if ("error" in held) return errorResult(held.error);
 			try {
-				const value = await held.page.evaluate(p.expression as unknown as string);
+				const value = await held.page.evaluate(p.expression);
 				const text = truncateText(typeof value === "string" ? value : (JSON.stringify(value) ?? "undefined"), cfg.maxBytes);
 				return textResult(text || "(undefined)");
 			} catch (err) {
@@ -752,10 +514,10 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 		}),
 		async execute(_toolCallId, params, signal) {
 			signal = operationSignal(signal);
-			const p = params as { script: string };
+			const p = params;
 			if (!p.script.endsWith(".js")) return errorResult("refusing non-.js script (PandaScript files end in .js)");
 			if (p.script.includes("..")) return errorResult("refusing path with ..");
-			const out: { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } = await new Promise((resolve) => {
+			return new Promise<ReturnType<typeof textResult>>((resolve) => {
 				execFile(resolveBin(), ["run", p.script], { timeout: cfg.timeoutMs + 10_000, maxBuffer: 8 * 1024 * 1024, signal }, (err, stdout, stderr) => {
 					if (err) {
 						resolve(errorResult(`lightpanda run failed: ${(stderr?.toString().trim() || err.message).slice(0, 800)}`));
@@ -764,7 +526,6 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 					resolve(textResult(truncateText(stdout.toString() || "(no output)", cfg.maxBytes)));
 				});
 			});
-			return out;
 		},
 	});
 
@@ -774,7 +535,7 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 		description: "Report Lightpanda binary version, CDP server reachability, and current page. No side effects.",
 		parameters: Type.Object({}),
 		async execute() {
-			return textResult(await statusText(cfg));
+			return textResult(await statusText(cfg, session));
 		},
 	});
 
@@ -783,18 +544,18 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const sub = parseSubcommand(args) || "status";
 			if (sub === "status") {
-				ctx.ui.notify(await statusText(cfg), "info");
+				ctx.ui.notify(await statusText(cfg, session), "info");
 			} else if (sub === "start") {
 				const srv = await ensureServer(cfg, lifecycle.signal);
 				ctx.ui.notify("error" in srv ? `lightpanda: ${srv.error}` : `lightpanda: server up on ${cfg.host}:${cfg.port}${srv.reused ? " (already running)" : " (started)"}`, "error" in srv ? "error" : "info");
 			} else if (sub === "stop") {
 				refMap.clear();
-				await closePage().catch(() => {});
+				await closePage();
 				ctx.ui.notify(await stopManagedServer() ? "lightpanda: managed server stopped" : "lightpanda: no managed server to stop (external servers are left alone)", "info");
 			} else if (sub === "setup") {
 				await runSetupCommand(ctx, lifecycle.signal);
 			} else if (sub === "update") {
-				await runUpdateCommand(ctx, cfg, () => refMap.clear(), lifecycle.signal);
+				await runUpdateCommand(ctx, cfg, session, () => refMap.clear(), lifecycle.signal);
 			} else {
 				ctx.ui.notify(`lightpanda: unknown subcommand "${sub}" — try /lightpanda status, setup, or update`, "warning");
 			}
@@ -812,47 +573,39 @@ export default function piLightpanda(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async () => {
 		lifecycle.abort();
 		refMap.clear();
-		await closePage().catch(() => {});
+		await closePage();
 		await stopManagedServer();
 	});
 }
 
-async function statusText(config: LightpandaConfig): Promise<string> {
+async function statusText(config: LightpandaConfig, session: BrowserSession): Promise<string> {
 	const bin = resolveBin();
 	const check = await binaryUsable(bin);
 	const version = check.usable ? check.version || "unknown version" : null;
 	const probe = await probeServer(config);
 	let pageLine = "page: —";
-	if (isPageAlive()) {
-		try {
-			pageLine = `page: ${page!.url() || "(blank)"} (persistent session)`;
-		} catch {
-			dropPage();
-		}
+	try {
+		const url = session.pageUrl();
+		if (url !== undefined) pageLine = `page: ${url || "(blank)"} (persistent session)`;
+	} catch {
+		await session.closePage();
 	}
 	return [
 		`binary: ${bin}${version ? ` (${version})` : " (not found — run /lightpanda setup)"}`,
-		`server: ${config.host}:${config.port} — ${probe.ok ? `up${probe.version ? ` (${probe.version})` : ""}${serverOurs ? " (managed)" : " (external)"}` : "down"}`,
+		`server: ${config.host}:${config.port} — ${probe.ok ? `up${probe.version ? ` (${probe.version})` : ""}${session.managed ? " (managed)" : " (external)"}` : "down"}`,
 		pageLine,
 		"note: partial Web API coverage, no screenshots — use Chromium-backed tools for complex sites",
 	].join("\n");
 }
 
-// Exposed for self-check scripts only; pi itself only uses the default export.
+// Private helpers exposed for behavioural tests; Pi uses only the default export.
 export const _internals = {
 	readConfig,
-	resolveBin,
 	parseSubcommand,
 	truncateText,
 	isHttpUrl,
 	formatSnapshot,
 	collectSnapshot,
-	fetchArgs,
-	endpointUrl,
-	ensureServer,
-	stopManagedServer,
 	restartAfterUpdate,
-	closePage,
 	TRUNC_MARKER,
-	LOOPBACK_HOSTS,
 };

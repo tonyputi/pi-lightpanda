@@ -49,6 +49,9 @@ task.
 
 ## Installation
 
+Requires **Node.js 22.19+** and Pi. Lightpanda supports Linux/macOS on x64 and
+ARM64; on Windows run both Pi and Lightpanda inside WSL2.
+
 ```bash
 pi install npm:pi-lightpanda
 ```
@@ -112,7 +115,10 @@ resolved at each tool call, in this order:
 2. `~/.pi/agent/bin/lightpanda` (where `/lightpanda setup` installs)
 3. `lightpanda` on `PATH`
 
-The remaining variables are optional tuning:
+The remaining variables are optional tuning, read when the extension loads.
+Numeric settings must be positive decimal safe integers (no fractions or trailing
+text); ports must be 1–65,535 and timeouts at most 2,147,473,647 ms (the Node
+timer limit minus the CLI grace period).
 
 | Variable | Meaning | Default |
 |---|---|---|
@@ -134,6 +140,18 @@ export PI_LIGHTPANDA_BIN="$HOME/tools/lightpanda"
 ```
 
 ## How it works
+
+```mermaid
+flowchart LR
+    Agent[Pi agent] --> Fetch[fetch]
+    Agent --> Run[run trusted PandaScript]
+    Fetch --> CLI[One-shot Lightpanda CLI]
+    Run --> CLI
+    Agent --> Tools[extract / navigate / snapshot / act / eval]
+    Tools --> Session[Per-instance browser session]
+    Session --> Page[Owned context + persistent page]
+    Page <-->|CDP over loopback| Server[Lightpanda server]
+```
 
 - `lightpanda_fetch` shells out to `lightpanda fetch <url> --dump markdown`
   — the cheapest path, no server process at all. Default for read-only work.
@@ -158,10 +176,17 @@ export PI_LIGHTPANDA_BIN="$HOME/tools/lightpanda"
 - `lightpanda_run` executes a trusted `.js` PandaScript file headlessly
   (`lightpanda run`) — reproducible automation without an LLM, same caution
   as running a shell script.
-- Every tool truncates output (`PI_LIGHTPANDA_MAX_BYTES`, default 12 KB) and
-  only `http(s)` URLs are accepted. The host guard refuses non-loopback CDP
-  endpoints: CDP controls cookies and sessions, so remote browsers are out of
-  scope.
+- Page dumps, snapshot text, evaluation results and script output are truncated
+  (`PI_LIGHTPANDA_MAX_BYTES`, default 12 KB). Extraction fits complete valid JSON.
+  Status messages, errors and small metadata responses are not page-data payloads
+  fitted to this budget. Legacy text truncation may append a marker outside the
+  global data allowance; explicit per-call budgets include that marker.
+- Page URL inputs accept only `http(s)`. This is **not** a network sandbox:
+  pages can request other resources or follow redirects. The host guard refuses
+  non-loopback CDP endpoints because CDP controls cookies and sessions.
+
+See [architecture and lifecycle](docs/architecture.md) for resource ownership,
+extraction stages and the test strategy.
 
 ## Tools & commands
 
@@ -321,13 +346,27 @@ Run `/lightpanda status` inside Pi.
 ## Development checks
 
 ```bash
-npx tsc --noEmit
-npm test
+npm ci --ignore-scripts
+npm run check          # strict typecheck + all offline tests, including npm artifact
+npm run test:coverage  # coverage floors: 90% lines, 80% branches, 85% functions
 ```
 
-The default suite requires no network or Lightpanda binary. It uses fake
-executables, HTTP streams and DOM elements to exercise failure paths as well
-as successful installs/updates.
+The default suite uses Node's built-in test runner and requires no network or
+Lightpanda binary. Small process, HTTP and DOM fixtures exercise failure paths
+as well as successful installs/updates. `npm run check` additionally runs a dry-run npm
+pack to verify the artifact contains every extension import and README-linked
+document, but no tests or development files. The artifact check is separate from
+unit/coverage runs to avoid repeatedly paying npm startup/packing cost.
+
+CI checks the minimum supported Node version and Node 24 on Linux, plus Node 24
+on macOS; coverage floors and the production dependency audit run in CI. A
+manual **Run workflow** on CI also installs a digest-verified upstream nightly
+and runs the real-browser smoke checks. Nightly availability does not block
+normal offline PR checks.
+
+Use `npm audit --omit=dev` for shipped dependencies. Review the full `npm audit`
+for development/release tooling separately; do not apply `npm audit fix --force`
+or transitive major overrides without testing the release path.
 
 With Lightpanda installed, run the optional integration check:
 
@@ -344,8 +383,8 @@ download/update binaries or use external sites.
 
 ## Contributing
 
-See the [contribution guide](.github/CONTRIBUTING.md) and
-[Code of Conduct](.github/CODE_OF_CONDUCT.md). Use the
+See the [contribution guide](https://github.com/tonyputi/pi-lightpanda/blob/main/.github/CONTRIBUTING.md) and
+[Code of Conduct](https://github.com/tonyputi/pi-lightpanda/blob/main/.github/CODE_OF_CONDUCT.md). Use the
 [issue forms](https://github.com/tonyputi/pi-lightpanda/issues/new/choose)
 for bugs and feature requests. Do not include secrets or private browsing data;
 report security issues privately as described in the contribution guide.

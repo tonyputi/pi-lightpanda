@@ -3,36 +3,9 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import extension from "./index.ts";
-import { findInstalledBinary, type WizardUI } from "./setup.ts";
+import { findInstalledBinary } from "./setup.ts";
+import { harness } from "./test-support.ts";
 import type { ExtractionOutput } from "./extract.ts";
-
-interface ToolResult { isError?: boolean; content: Array<{ text?: string }>; structuredContent?: ExtractionOutput }
-interface Tool { name: string; execute(id: string, params: unknown, signal?: AbortSignal): Promise<ToolResult> }
-const ui: WizardUI = { confirm: async () => { throw new Error("smoke test must never prompt or download"); }, notify: () => {} };
-const ctx = { hasUI: true, ui };
-function harness() {
-	const tools = new Map<string, Tool>();
-	let command: (args: string, context: typeof ctx) => Promise<void>;
-	let shutdown: () => Promise<void>;
-	extension({
-		registerTool: (tool: Tool) => tools.set(tool.name, tool),
-		registerCommand: (_name: string, value: { handler: typeof command }) => { command = value.handler; },
-		on: (name: string, handler: () => Promise<void>) => { if (name === "session_shutdown") shutdown = handler; },
-	} as unknown as ExtensionAPI);
-	return {
-		async call(name: string, params: unknown = {}) {
-			const result = await tools.get(`lightpanda_${name}`)!.execute("smoke", params);
-			const text = result.content.map((item) => item.text ?? "").join("\n");
-			assert.ok(!result.isError, `${name}: ${text}`);
-			return text;
-		},
-		tools,
-		command: (args: string) => command(args, ctx),
-		shutdown: () => shutdown(),
-	};
-}
 
 async function listen(server: Server): Promise<number> {
 	await new Promise<void>((resolve, reject) => {
