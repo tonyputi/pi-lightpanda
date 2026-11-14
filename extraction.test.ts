@@ -2,9 +2,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Check } from "typebox/value";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import puppeteer from "puppeteer-core";
-import extension from "./index.ts";
+import { harness, type ToolResult } from "./test-support.ts";
 import {
 	collectExtraction, effectiveMaxBytes, extractionFailed, ExtractionOutputSchema, prepareExtraction,
 	validateExtractionParams, type ExtractionParams, type ExtractionOutput,
@@ -240,17 +239,13 @@ await test("same-priority fields share character and byte quotas independently o
 	}
 }));
 
-await test("list values share a limited character quota instead of starving later matches", async () => withDom((nodes) => {
-	nodes.set(".bulk", Array.from({ length: 3 }, () => new ElementFixture("x".repeat(100))));
-	const result = collectExtraction([{ name: "list", selector: ".bulk", many: true }], 20, 11);
+await test("list values share character and serialized byte quotas instead of starving later matches", async () => withDom((nodes) => {
+	nodes.set(".bulk", Array.from({ length: 3 }, () => new ElementFixture("x".repeat(1000))));
+	const input = params([{ name: "list", selector: ".bulk", many: true }]);
+	const result = collectExtraction(input.fields, 20, 11);
 	assert.deepEqual(result.fields[0].values.map((value) => value!.length), [3, 4, 4]);
 	assert.equal(result.fields[0].matches, 3);
 	assert.equal(result.fields[0].truncated, true);
-}));
-
-await test("list values also share the serialized byte quota", async () => withDom((nodes) => {
-	nodes.set(".bulk", Array.from({ length: 3 }, () => new ElementFixture("x".repeat(1000))));
-	const input = params([{ name: "list", selector: ".bulk", many: true }]);
 	const output = prepareExtraction(collectExtraction(input.fields, 20, 10000), input, 600);
 	const lengths = output.fields[0].values.map((value) => value!.length);
 	assert.ok(lengths.every((length) => length > 0));
@@ -279,12 +274,7 @@ await test("the DOM collector serializes without closures and only reads the pag
 await test("registered tool returns matching JSON/structuredContent, supports current page and keeps partial failure data", async () => withDom(async (nodes) => {
 	const savedConnect = puppeteer.connect;
 	const savedFetch = globalThis.fetch;
-	type RegisteredTool = {
-		name: string; executionMode?: string; outputSchema?: unknown;
-		execute(id: string, params: unknown): Promise<{ content: Array<{ text?: string }>; structuredContent?: ExtractionOutput; isError?: boolean }>;
-	};
-	const tools = new Map<string, RegisteredTool>();
-	let shutdown: (() => Promise<void>) | undefined;
+	let pi: ReturnType<typeof harness> | undefined;
 	let navigations = 0;
 	let waitedFor = "";
 	let collectionBudget = 0;
@@ -307,12 +297,8 @@ await test("registered tool returns matching JSON/structuredContent, supports cu
 	})) as unknown as typeof puppeteer.connect;
 	globalThis.fetch = async () => Response.json({ Browser: "external fixture" });
 	try {
-		extension({
-			registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool),
-			registerCommand: () => {},
-			on: (name: string, handler: () => Promise<void>) => { if (name === "session_shutdown") shutdown = handler; },
-		} as unknown as ExtensionAPI);
-		const tool = tools.get("lightpanda_extract")!;
+		pi = harness();
+		const tool = pi.tools.get("lightpanda_extract")!;
 		assert.ok(tool.outputSchema);
 		assert.equal(tool.executionMode, "sequential");
 		const fields = [{ name: "name", selector: "h1", required: true }];
@@ -353,7 +339,7 @@ await test("registered tool returns matching JSON/structuredContent, supports cu
 	} finally {
 		if (savedCeiling === undefined) delete process.env.PI_LIGHTPANDA_MAX_BYTES;
 		else process.env.PI_LIGHTPANDA_MAX_BYTES = savedCeiling;
-		await shutdown?.();
+		await pi?.shutdown();
 		puppeteer.connect = savedConnect;
 		globalThis.fetch = savedFetch;
 	}
@@ -367,15 +353,12 @@ function within<T>(promise: Promise<T>, milliseconds = 1000): Promise<T> {
 	return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-for (const stage of ["navigation", "readiness", "selector", "ignored-selector"] as const) {
-	await test(`cancelling ${stage} prevents subsequent DOM extraction`, async () => withDom(async () => {
+await test("cancellation at each browser wait prevents subsequent DOM extraction", async () => {
+	for (const stage of ["navigation", "readiness", "selector", "ignored-selector"] as const) await withDom(async () => {
 		const savedConnect = puppeteer.connect;
 		const savedFetch = globalThis.fetch;
-		type ToolResult = { isError?: boolean; content: Array<{ text?: string }> };
-		type Tool = { name: string; execute(id: string, params: unknown, signal?: AbortSignal): Promise<ToolResult> };
-		const tools = new Map<string, Tool>();
+		let pi: ReturnType<typeof harness> | undefined;
 		const controller = new AbortController();
-		let shutdown: (() => Promise<void>) | undefined;
 		let finishWait: (() => void) | undefined;
 		let enteredWait!: () => void;
 		const entered = new Promise<void>((resolve) => { enteredWait = resolve; });
@@ -403,11 +386,8 @@ for (const stage of ["navigation", "readiness", "selector", "ignored-selector"] 
 		})) as unknown as typeof puppeteer.connect;
 		globalThis.fetch = async () => Response.json({ Browser: "external fixture" });
 		try {
-			extension({
-				registerTool: (tool: Tool) => tools.set(tool.name, tool), registerCommand: () => {},
-				on: (name: string, handler: () => Promise<void>) => { if (name === "session_shutdown") shutdown = handler; },
-			} as unknown as ExtensionAPI);
-			pending = tools.get("lightpanda_extract")!.execute("cancel", {
+			pi = harness();
+			pending = pi.tools.get("lightpanda_extract")!.execute("cancel", {
 				url: "https://fixture.test/", fields: [{ name: "name", selector: "h1" }], waitForSelector: "h1",
 			}, controller.signal);
 			await within(entered);
@@ -423,9 +403,9 @@ for (const stage of ["navigation", "readiness", "selector", "ignored-selector"] 
 			controller.abort();
 			finishWait?.();
 			await pending?.catch(() => {});
-			await shutdown?.();
+			await pi?.shutdown();
 			puppeteer.connect = savedConnect;
 			globalThis.fetch = savedFetch;
 		}
-	}));
-}
+	});
+});

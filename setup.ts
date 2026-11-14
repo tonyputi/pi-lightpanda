@@ -131,13 +131,13 @@ export async function downloadBinary(
 		await res.body?.cancel();
 		throw new Error(`download failed: HTTP ${res.status} — check https://github.com/${REPO}/releases`);
 	}
-	const source = Readable.fromWeb(res.body as NodeReadableStream<Uint8Array>);
 	const contentLength = Number(res.headers.get("content-length"));
 	const totalBytes = Number.isFinite(contentLength) && contentLength > 0 ? contentLength : undefined;
 	const hash = createHash("sha256");
 	let downloadedBytes = 0;
 	let lastUpdate = 0;
 	let file: Awaited<ReturnType<typeof open>> | undefined;
+	let source: Readable | undefined;
 	try {
 		signal.throwIfAborted();
 		if (totalBytes && totalBytes > MAX_DOWNLOAD_BYTES) throw new Error("download exceeds the 256 MB safety limit");
@@ -161,6 +161,9 @@ export async function downloadBinary(
 				}
 			},
 		});
+		// Attach the Node stream only when pipeline can immediately own its errors.
+		// A remote body can fail while mkdir/open are still pending.
+		source = Readable.fromWeb(res.body as NodeReadableStream<Uint8Array>);
 		await pipeline(source, meter, file.createWriteStream(), { signal });
 		if (downloadedBytes < 1024 * 1024) throw new Error(`downloaded file suspiciously small (${downloadedBytes} bytes) — the nightly asset may be missing`);
 		if (totalBytes && downloadedBytes !== totalBytes) throw new Error("download size does not match Content-Length");
@@ -176,7 +179,8 @@ export async function downloadBinary(
 		throw err;
 	} finally {
 		// Cancel HTTP bodies even when opening the destination failed.
-		source.destroy();
+		if (source) source.destroy();
+		else await res.body.cancel().catch(() => {});
 		await file?.close().catch(() => {});
 	}
 }
@@ -198,8 +202,10 @@ export async function fetchLatestAssetInfo(asset: string, fetcher: typeof fetch 
 		signal: parentSignal ? AbortSignal.any([timeout, parentSignal]) : timeout,
 	});
 	if (!response.ok) throw new Error(`GitHub release API returned HTTP ${response.status}`);
-	const release = (await response.json()) as { assets?: Array<{ name?: unknown; digest?: unknown; updated_at?: unknown }> };
-	const found = release.assets?.find((item) => item.name === asset);
+	const release: unknown = await response.json();
+	const assets = release && typeof release === "object" && "assets" in release ? release.assets : undefined;
+	const found = Array.isArray(assets) ? assets.find((item: unknown): item is Record<string, unknown> =>
+		item !== null && typeof item === "object" && "name" in item && item.name === asset) : undefined;
 	const digest = typeof found?.digest === "string" ? found.digest.match(/^sha256:([a-f0-9]{64})$/i)?.[1]?.toLowerCase() : undefined;
 	if (!digest || typeof found?.updated_at !== "string" || !Number.isFinite(Date.parse(found.updated_at))) throw new Error(`release asset metadata unavailable for ${asset}`);
 	return { sha256: digest, updatedAt: found.updated_at };
@@ -209,7 +215,7 @@ export function sha256File(path: string, signal?: AbortSignal): Promise<string> 
 	return new Promise((resolve, reject) => {
 		const hash = createHash("sha256");
 		const stream = createReadStream(path, { signal });
-		stream.on("data", (chunk: Buffer) => hash.update(chunk));
+		stream.on("data", (chunk) => hash.update(chunk));
 		stream.on("error", reject);
 		stream.on("end", () => resolve(hash.digest("hex")));
 	});
@@ -299,9 +305,3 @@ export async function runSetupWizard(ui: WizardUI, opts: WizardOptions = {}): Pr
 	const version = await installVerifiedBinary(ui, asset, target, latest.sha256, "pi-lightpanda-setup", opts);
 	return { target, version, skipped: false };
 }
-
-export const _setupInternals = {
-	assetName, formatDownloadProgress, defaultBinPath, installTarget, resolveBin, downloadUrl,
-	binaryUsable, downloadBinary, runSetupWizard, fetchLatestAssetInfo, sha256File,
-	findInstalledBinary, checkForUpdate, runUpdateWizard,
-};

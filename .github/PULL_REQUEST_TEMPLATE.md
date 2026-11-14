@@ -8,8 +8,9 @@
 
 ## Checklist
 
-- [ ] `npx tsc --noEmit` and `npm test` pass
+- [ ] `npm run check` and `npm run test:coverage` pass
 - [ ] CDP changes checked with `npm run test:smoke`, or the reason it was not run is noted
 - [ ] No secrets or private browsing data in examples, logs, or fixtures
 - [ ] No new runtime dependencies
-- [ ] README updated if user-visible behavior changed
+- [ ] README/architecture diagrams updated if user-visible behavior or ownership changed
+- [ ] Dependency updates reviewed with `npm audit` (including remaining development-tool advisories)
