@@ -26,6 +26,6 @@ body:
     id: alternatives
     attributes:
       label: What alternatives have you considered?
-      description: Existing tools, manual workarounds, or configuration that already gets you part of the way. Explain why fetch, eval, a PandaScript, or a Chromium-backed tool is not sufficient.
+      description: Existing tools, manual workarounds, or configuration that already gets you part of the way. Explain why fetch, selector-based extract, eval, a PandaScript, or a Chromium-backed tool is not sufficient.
     validations:
       required: false

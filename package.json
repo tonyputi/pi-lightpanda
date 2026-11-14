@@ -1,7 +1,10 @@
 {
   "name": "pi-lightpanda",
   "version": "0.3.0",
-  "description": "Lightweight headless browser for the Pi agent via Lightpanda (CDP-compatible, ~16x less memory than Chrome)",
+  "description": "Lightweight, CDP-compatible browser tools for the Pi agent via Lightpanda, without Chromium",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "license": "MIT",
   "type": "module",
   "keywords": [
@@ -25,9 +28,11 @@
   },
   "files": [
     "index.ts",
+    "browser.ts",
     "setup.ts",
     "extract.ts",
     "README.md",
+    "docs/",
     "LICENSE"
   ],
   "peerDependencies": {
@@ -38,12 +43,16 @@
     "@earendil-works/pi-coding-agent": "^1.2.0",
     "@semantic-release/changelog": "^7.0.0",
     "@semantic-release/git": "^11.0.1",
-    "@types/node": "^26.6.5",
+    "@types/node": "^22.20.5",
     "semantic-release": "^25.0.9",
     "typescript": "^7.0.2"
   },
   "scripts": {
-    "test": "node test.ts && node --test reliability.test.ts extraction.test.ts",
+    "check": "npm run typecheck && npm test && npm run test:package",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test *.test.ts",
+    "test:coverage": "node --experimental-test-coverage --test --test-coverage-lines=90 --test-coverage-branches=80 --test-coverage-functions=85 --test-coverage-include=index.ts --test-coverage-include=browser.ts --test-coverage-include=setup.ts --test-coverage-include=extract.ts *.test.ts",
+    "test:package": "node --test package-check.ts",
     "test:smoke": "node smoke.ts"
   },
   "release": {

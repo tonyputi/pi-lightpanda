@@ -4,30 +4,73 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint-title:
     runs-on: ubuntu-latest
-    # Dependabot titles ("Bump ...") are never conventional; the squash-merge
-    # title we choose is what semantic-release actually reads.
+    permissions:
+      pull-requests: read
+    # Dependabot titles are not conventional; the reviewed squash title controls releases.
     if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
     steps:
-      - uses: amannn/action-semantic-pull-request@v6
+      - uses: amannn/action-semantic-pull-request@2252a14e810aa9b85c2d560bd7070c802206ecf6 # v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
-        node: [22, 24]
+        os: [ubuntu-latest]
+        node: ['22.19.0', '24']
+        include:
+          - os: macos-latest
+            node: '24'
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: ${{ matrix.node }}
-      - run: npm ci
-      - run: npx tsc --noEmit
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
       - run: npm test
+        if: matrix.os != 'ubuntu-latest' || matrix.node != '24'
+      - run: npm run test:coverage
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '24'
+      - run: npm run test:package
+        if: matrix.os == 'ubuntu-latest' && matrix.node == '24'
+      - run: npm audit --omit=dev
+  smoke:
+    # Nightlies move independently of this extension. Run explicitly rather than
+    # letting an upstream nightly or GitHub availability block every offline PR.
+    if: github.event_name == 'workflow_dispatch'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Install and verify upstream nightly
+        run: >-
+          node --input-type=module -e
+          'import { runSetupWizard } from "./setup.ts";
+          console.log(await runSetupWizard({ confirm: async () => true, notify: console.log }));'
+      - run: npm run test:smoke
