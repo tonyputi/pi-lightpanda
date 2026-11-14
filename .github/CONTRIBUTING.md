@@ -25,7 +25,12 @@ With Lightpanda already installed, optionally run:
 npm run test:smoke   # real CDP checks against ephemeral loopback fixtures
 ```
 
-The smoke test does not install/update binaries or visit external sites.
+The smoke test does not install/update binaries or visit external sites. It also
+compares default Markdown, 4 KB Markdown and three required extracted fields on
+the same local page. It prints returned UTF-8 byte counts (including truncation
+markers and JSON metadata) and checks that the requested values remain present.
+The fixture and assertions live in `smoke.ts`; exact sizes can vary with the
+Lightpanda version and are not token or performance benchmarks.
 
 Requires Node 22.19+; CI also checks Node 24 and macOS. No build step: Pi loads
 `index.ts`, `browser.ts`, `setup.ts` and `extract.ts` directly; tests use native
