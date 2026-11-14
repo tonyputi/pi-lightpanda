@@ -225,9 +225,11 @@ returning broken JSON. Increase the per-call budget within the ceiling, request
 fewer/shorter fields, or change the global configuration if needed. Error
 messages are not page-data payloads and are not fitted to this budget.
 
-For a reproducible same-page comparison of default Markdown, 4 KB Markdown
-and three named fields, see [output-byte evidence](docs/output-budget-evidence.md).
-This measures output/context bytes only, not browser performance or token usage.
+When you only need a few known fields, extraction can return much less text
+than a full Markdown dump. The smoke test illustrates this on a controlled
+fixture while checking that the requested values survive. This is not a general
+savings estimate: it measures UTF-8 output bytes, not tokens or browser
+performance.
 
 ## Structured extraction
 

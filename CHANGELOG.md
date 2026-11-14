@@ -1,3 +1,8 @@
+# Historical changelog
+
+For subsequent releases, see [GitHub Releases](https://github.com/tonyputi/pi-lightpanda/releases).
+This file is retained as history and is no longer updated automatically.
+
 # [0.3.0](https://github.com/tonyputi/pi-lightpanda/compare/v0.2.1...v0.3.0) (2026-10-15)
 
 

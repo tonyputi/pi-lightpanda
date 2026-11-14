@@ -112,7 +112,12 @@ CI. GitHub Actions are pinned to commit hashes, with version comments so
 Dependabot can propose reviewed updates. CI has read-only repository access;
 the release workflow alone needs release/write permissions and publishing
 credentials. Releases are serialized and rerun the local quality gate before
-semantic-release.
+semantic-release. It sets the package version in the runner, publishes to npm,
+and creates a Git tag and GitHub Release with release notes. It does not commit
+version/changelog updates back to protected `main`: do not add a Git push-back
+plugin without designing a compatible PR-based workflow. The checkout's
+`package.json` version can therefore lag the published version; GitHub Releases
+are the source for current release notes.
 
 Separate shipped dependency advisories (`npm audit --omit=dev`) from development
 and release-tool advisories (`npm audit`). Prefer compatible fixes. An advisory
